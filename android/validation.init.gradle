@@ -1,0 +1,16 @@
+// Standalone native validation; does not change the published plugin dependencies.
+// Run from android/: ../example/android/gradlew -p . -I validation.init.gradle compileDebugKotlin testDebugUnitTest
+allprojects { project ->
+    afterEvaluate {
+        if (project == rootProject) {
+            def properties = new Properties()
+            project.file('local.properties').withInputStream { properties.load(it) }
+            def flutterSdk = properties.getProperty('flutter.sdk')
+            if (flutterSdk == null) throw new GradleException('flutter.sdk is required in local.properties')
+            def embedding = new File(flutterSdk, 'bin/cache/artifacts/engine/android-arm64/flutter.jar')
+            if (!embedding.exists()) throw new GradleException('Run flutter precache --android first')
+            dependencies.add('compileOnly', project.files(embedding))
+            dependencies.add('testImplementation', project.files(embedding))
+        }
+    }
+}

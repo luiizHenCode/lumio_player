@@ -1,0 +1,15 @@
+Lumio Player — Private software
+
+Copyright (c) 2026 Lumio Player contributors.
+All rights reserved.
+
+This repository is private software. No open-source license or permission to
+redistribute, sublicense, or publish it is granted by this file. Authorized
+internal use is subject to the agreements of the copyright holders.
+
+Third-party components remain subject to their respective licenses. In
+particular, bundled HLS.js notices are in assets/web/HLS-LICENSE.txt and
+assets/web/APACHE-2.0.txt.
+
+A public release requires an explicit licensing decision by the copyright
+holders and a review of all third-party notices.

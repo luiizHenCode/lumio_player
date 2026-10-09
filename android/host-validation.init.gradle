@@ -1,0 +1,19 @@
+// Validate against the generated example host without modifying its settings or Dart metadata.
+settingsEvaluated { settings ->
+    def pluginDirectory = new File(settings.settingsDir, '../../android')
+    if (new File(pluginDirectory, 'src/main/kotlin/dev/lumio/lumio_player/LumioPlayerPlugin.kt').exists()) {
+        settings.include(':lumio_player')
+        settings.project(':lumio_player').projectDir = pluginDirectory
+    }
+}
+allprojects { project ->
+    afterEvaluate {
+        if (project.name == 'lumio_player') {
+            def properties = new Properties()
+            project.file('local.properties').withInputStream { properties.load(it) }
+            def embedding = new File(properties.getProperty('flutter.sdk'), 'bin/cache/artifacts/engine/android-arm64/flutter.jar')
+            dependencies.add('compileOnly', project.files(embedding))
+            dependencies.add('testImplementation', project.files(embedding))
+        }
+    }
+}

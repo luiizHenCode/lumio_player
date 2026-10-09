@@ -1,0 +1,31 @@
+name: lumio_player
+description: Native Android and iOS video/audio playback with a unified controller, diagnostics and optional WebView fallback.
+version: 0.1.0
+publish_to: none
+
+environment:
+  sdk: '>=3.12.0 <4.0.0'
+  flutter: '>=3.44.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  webview_flutter: ^4.13.0
+  webview_flutter_android: ^4.10.0
+  webview_flutter_wkwebview: ^3.23.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  plugin:
+    platforms:
+      android:
+        package: dev.lumio.lumio_player
+        pluginClass: LumioPlayerPlugin
+      ios:
+        pluginClass: LumioPlayerPlugin
+  assets:
+    - assets/web/
