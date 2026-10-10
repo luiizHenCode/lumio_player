@@ -32,6 +32,7 @@ class LumioWebEngine {
   final Map<int, Completer<void>> _pending = {};
   Map<String, dynamic> _state = {};
   bool _disposed = false;
+  Future<void>? _disposal;
   bool _mounted = false;
   int _sequence = 0;
   int? _opening;
@@ -98,9 +99,9 @@ class LumioWebEngine {
   }
 
   void _receive(JavaScriptMessage message) {
-    if (_disposed) return;
     try {
       final event = jsonDecode(message.message) as Map<String, dynamic>;
+      if (_disposed && event['type'] != 'ack') return;
       switch (event['type']) {
         case 'ready':
           if (!_ready.isCompleted) _ready.complete();
@@ -370,8 +371,8 @@ class LumioWebEngine {
     _opening = null;
   }
 
-  Future<void> dispose() async {
-    if (_disposed) return;
+  Future<void> dispose() {
+    if (_disposal != null) return _disposal!;
     _disposed = true;
     ++_openGeneration;
     for (final pending in _pending.values) {
@@ -379,10 +380,23 @@ class LumioWebEngine {
     }
     _pending.clear();
     if (!_ready.isCompleted) _ready.complete();
+    return _disposal = _disposeMedia();
+  }
+
+  Future<void> _disposeMedia() async {
+    final id = ++_sequence;
     try {
-      await _send({'method': 'dispose'}).timeout(const Duration(seconds: 2));
-    } catch (_) {
-      // The widget may already be detached. No platform disposal API exists.
+      // Dispatch alone does not prove pause/HLS teardown completed in the page.
+      await _request(
+        id,
+        'dispose',
+        const {},
+      ).timeout(const Duration(seconds: 2));
+    } finally {
+      _pending.remove(id);
+      _state = {};
+      // WebView has no explicit native-controller disposal API. Detaching its
+      // widget still belongs to the host; this ACK confirms media cleanup only.
     }
   }
 }

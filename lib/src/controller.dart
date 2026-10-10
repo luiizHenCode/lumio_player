@@ -1,19 +1,22 @@
 import 'dart:async';
 
 import 'package:flutter/foundation.dart';
-import 'package:flutter/painting.dart' show BoxFit;
+import 'package:flutter/widgets.dart';
 import 'package:flutter/services.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
 import 'models.dart';
 import 'native_bridge.dart';
+import 'recovery_configuration.dart';
 import 'web_engine.dart';
 
 /// A player instance. Mount LumioPlayerView before awaiting WebView initialization.
 /// Commands are serialized; dispose invalidates all outstanding engine events.
-class LumioPlayerController extends ValueNotifier<LumioPlayerState> {
+class LumioPlayerController extends ValueNotifier<LumioPlayerState>
+    with WidgetsBindingObserver {
   LumioPlayerController({
     this.configuration = const LumioPlayerConfiguration(),
+    this.recovery = const LumioRecoveryConfiguration(),
     this.logger,
     Map<String, String> httpHeaders = const {},
   }) : httpHeaders = Map.unmodifiable(httpHeaders),
@@ -29,8 +32,17 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState> {
          ),
        ) {
     configuration.validate();
+    recovery.validate();
+    final binding = WidgetsBinding.instance;
+    _foreground = !_isBackground(binding.lifecycleState);
+    binding.addObserver(this);
   }
+  static int _nextPlayerId = 0;
+
+  /// Stable identifier for correlating opening and disposal logs.
+  final int playerId = ++_nextPlayerId;
   final LumioPlayerConfiguration configuration;
+  final LumioRecoveryConfiguration recovery;
   final LumioLogger? logger;
 
   /// Default headers for network sources. Per-source/open headers take precedence.
@@ -51,6 +63,10 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState> {
   Future<void> _queue = Future.value();
   Future<void>? _disposal;
   bool _disposed = false, _fallbackUsed = false;
+  int _pendingNativeCreations = 0, _pendingLateReleases = 0;
+  bool _cleanupFailed = false, _closeFinished = false;
+  bool _disposedLogged = false, _incompleteLogged = false;
+  final _disposalWatch = Stopwatch();
   double _volume, _speed;
   BoxFit _videoFit = BoxFit.contain;
   BoxFit get videoFit => _videoFit;
@@ -71,6 +87,214 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState> {
   int get speedRevision => _speedRevision;
   bool _looping;
   bool _wantsPlayback;
+  bool _foreground = true;
+  int _intentRevision = 0, _recoveryRevision = 0, _attempts = 0;
+  Timer? _watchdog, _recoveryTimer;
+  bool _recoveryQueued = false;
+  Duration? _lastPosition;
+  DateTime? _lastProgress, _stableSince;
+
+  bool get _effectivePlayback =>
+      _wantsPlayback && (_foreground || configuration.allowBackgroundPlayback);
+
+  static bool _isBackground(AppLifecycleState? state) =>
+      state == AppLifecycleState.hidden ||
+      state == AppLifecycleState.paused ||
+      state == AppLifecycleState.detached;
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (_disposed || state == AppLifecycleState.inactive) return;
+    final foreground = !_isBackground(state);
+    if (_foreground == foreground) return;
+    _foreground = foreground;
+    _invalidateRecovery();
+    final revision = _intentRevision;
+    unawaited(
+      _serialize(() async {
+        if (revision != _intentRevision || _foreground != foreground) return;
+        if (!configuration.allowBackgroundPlayback &&
+            value.initialized &&
+            !value.transitioning &&
+            (!_foreground || value.error == null)) {
+          await _command(_effectivePlayback ? 'play' : 'pause');
+        }
+        if (_foreground) {
+          if (value.error != null) _scheduleRecovery(value.error!);
+          _armWatchdog();
+        }
+      }).catchError((Object error) {
+        if (!_disposed) {
+          value = value.copyWith(error: _asError(error, value.engine));
+        }
+      }),
+    );
+  }
+
+  Future<void> _changePlayback(
+    Future<void> Function() action, {
+    bool newSource = false,
+  }) {
+    _invalidateRecovery();
+    if (newSource) {
+      _attempts = 0;
+      _wantsPlayback = configuration.autoPlay;
+      ++_intentRevision;
+    }
+    return _serialize(() async {
+      // An earlier queued open may have scheduled recovery since submission.
+      _invalidateRecovery();
+      if (newSource) _attempts = 0;
+      await action();
+    });
+  }
+
+  void _invalidateRecovery() {
+    ++_recoveryRevision;
+    _watchdog?.cancel();
+    _watchdog = null;
+    _recoveryTimer?.cancel();
+    _recoveryTimer = null;
+    _recoveryQueued = false;
+    _lastPosition = null;
+    _lastProgress = null;
+    _stableSince = null;
+  }
+
+  bool get _recoveryEligible =>
+      !_disposed &&
+      recovery.enabled &&
+      _foreground &&
+      _wantsPlayback &&
+      _source?.type == LumioSourceType.network &&
+      (configuration.mode == LumioPlaybackMode.live || value.live) &&
+      !value.transitioning &&
+      !value.completed;
+
+  bool _temporaryError(LumioPlayerError error) {
+    final text = '${error.code} ${error.message} ${error.details}'
+        .toLowerCase();
+    // Media3 names, HTTP statuses, AVFoundation and NSURLError codes.
+    if (RegExp(
+          r'auth|(?:^|[^0-9])(401|403|404)(?:[^0-9]|$)|invalid|unsupported|codec|decoder|decoding|malformed|not.found|out.of.range|parsing|permission|denied',
+        ).hasMatch(text) ||
+        RegExp(
+          r'-(1000|1002|1011|1012|1013|1100|11828|11829|11850)\b',
+        ).hasMatch(text)) {
+      return false;
+    }
+    return error.recoverable ||
+        RegExp(
+          r'network|\bio\b|io_|timeout|timed.out|behind_live_window|connection|temporar',
+        ).hasMatch(text) ||
+        RegExp(
+          r'-(1001|1003|1004|1005|1006|1009|1018|1019|1020|11819)\b',
+        ).hasMatch(text);
+  }
+
+  void _scheduleRecovery(LumioPlayerError error) {
+    if (!_temporaryError(error)) {
+      _invalidateRecovery();
+      return;
+    }
+    if (!_recoveryEligible || _recoveryTimer != null || _recoveryQueued) {
+      return;
+    }
+    _watchdog?.cancel();
+    _watchdog = null;
+    _stableSince = null;
+    if (_attempts >= recovery.maxAttempts) {
+      value = value.copyWith(error: error, buffering: false);
+      return;
+    }
+    var delay = recovery.initialDelay;
+    for (var i = 0; i < _attempts && delay < recovery.maxDelay; i++) {
+      delay *= 2;
+      if (delay > recovery.maxDelay) delay = recovery.maxDelay;
+    }
+    final revision = _recoveryRevision;
+    final engine = value.engine;
+    _recoveryTimer = Timer(delay, () {
+      _recoveryTimer = null;
+      if (revision != _recoveryRevision || !_recoveryEligible) return;
+      _recoveryQueued = true;
+      unawaited(
+        _serialize(() async {
+          if (revision != _recoveryRevision || !_recoveryEligible) return;
+          _recoveryQueued = false;
+          ++_attempts;
+          _log(
+            LumioLogLevel.warning,
+            'recovery_attempt',
+            'Live network restart $_attempts/${recovery.maxAttempts}.',
+            engine: engine,
+          );
+          await _start(engine, autoPlay: _wantsPlayback, recovering: true);
+        }).catchError((Object _) {}),
+      );
+    });
+  }
+
+  void _armWatchdog() {
+    if (!_recoveryEligible ||
+        !value.initialized ||
+        value.error != null ||
+        _watchdog != null ||
+        _recoveryTimer != null ||
+        _recoveryQueued) {
+      return;
+    }
+    _lastPosition = value.position;
+    _lastProgress = DateTime.now();
+    _stableSince = null;
+    final interval = Duration(
+      microseconds: (recovery.stallTimeout.inMicroseconds ~/ 4).clamp(
+        1,
+        1000000,
+      ),
+    );
+    _watchdog = Timer.periodic(interval, (_) {
+      if (!_recoveryEligible || !value.initialized || value.error != null) {
+        _watchdog?.cancel();
+        _watchdog = null;
+        _stableSince = null;
+        return;
+      }
+      final elapsed = DateTime.now().difference(_lastProgress!);
+      if (elapsed >= recovery.stallTimeout) {
+        const error = LumioPlayerError(
+          code: 'live_position_stall',
+          message: 'Live playback position stopped advancing (heuristic).',
+          recoverable: true,
+        );
+        value = value.copyWith(error: error);
+        _scheduleRecovery(error);
+      } else if (elapsed >= recovery.stallTimeout ~/ 2) {
+        _stableSince = null;
+      }
+    });
+  }
+
+  void _observeProgress() {
+    if (!_recoveryEligible || !value.initialized || value.error != null) {
+      _stableSince = null;
+      return;
+    }
+    _armWatchdog();
+    final position = value.position;
+    if (_lastPosition != null && position > _lastPosition!) {
+      final now = DateTime.now();
+      _stableSince ??= now;
+      _lastProgress = now;
+      if (now.difference(_stableSince!) >= recovery.stablePlaybackDuration) {
+        _attempts = 0;
+      }
+    } else if (_lastPosition != null && position < _lastPosition!) {
+      _stableSince = null;
+    }
+    _lastPosition = position;
+  }
+
   final _logs = StreamController<LumioLogEntry>.broadcast();
 
   LumioSource? get source => _source;
@@ -100,7 +324,8 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState> {
       network: true,
       localFiles: !web,
       assets: !web,
-      httpHeaders: !web && android,
+      httpHeaders:
+          !web && (android || defaultTargetPlatform == TargetPlatform.iOS),
       detailedBufferControl: !web && android,
       volumeControl: !(web && defaultTargetPlatform == TargetPlatform.iOS),
       nativePlaylist: !web,
@@ -162,26 +387,25 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState> {
     LumioSource source, {
     Map<String, String> headers = const {},
     String? title,
-  }) => _serialize(() async {
+  }) => _changePlayback(() async {
     _playlist = null;
     _playlistIndex = 0;
     _title = title;
     _source = _withHeaders(source, headers);
-    _wantsPlayback = configuration.autoPlay;
     _fallbackUsed = false;
     await _start(
       _requestedEngine == LumioPlaybackEngine.webview
           ? LumioPlaybackEngine.webview
           : LumioPlaybackEngine.native,
-      autoPlay: configuration.autoPlay,
+      autoPlay: _wantsPlayback,
     );
-  });
+  }, newSource: true);
 
   Future<void> openPlaylist(
     LumioPlaylist playlist, {
     int initialIndex = 0,
     Map<String, String> headers = const {},
-  }) => _serialize(() async {
+  }) => _changePlayback(() async {
     if (initialIndex < 0 || initialIndex >= playlist.items.length) {
       throw RangeError.index(initialIndex, playlist.items);
     }
@@ -195,7 +419,6 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState> {
     _playlistIndex = initialIndex;
     _title = null;
     _source = _playlist!.items[initialIndex].source;
-    _wantsPlayback = configuration.autoPlay;
     _fallbackUsed = false;
     await _start(
       _requestedEngine == LumioPlaybackEngine.webview
@@ -203,19 +426,19 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState> {
           : LumioPlaybackEngine.native,
       autoPlay: _wantsPlayback,
     );
-  });
+  }, newSource: true);
 
-  Future<void> next() => _serialize(() async {
+  Future<void> next() => _changePlayback(() async {
     if (!hasNext) return;
     await _selectPlaylistItem((_playlistIndex + 1) % _playlist!.items.length);
   });
-  Future<void> previous() => _serialize(() async {
+  Future<void> previous() => _changePlayback(() async {
     if (!hasPrevious) return;
     await _selectPlaylistItem(
       (_playlistIndex - 1 + _playlist!.items.length) % _playlist!.items.length,
     );
   });
-  Future<void> selectPlaylistItem(int index) => _serialize(() async {
+  Future<void> selectPlaylistItem(int index) => _changePlayback(() async {
     final playlist = _playlist;
     if (playlist == null) {
       throw StateError('Open a playlist before selecting an item.');
@@ -227,6 +450,8 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState> {
   });
 
   Future<void> _selectPlaylistItem(int index) async {
+    _invalidateRecovery();
+    _attempts = 0;
     _playlistIndex = index;
     _source = _playlist!.items[index].source;
     _fallbackUsed = false;
@@ -262,10 +487,15 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState> {
       await guarded(
         _bridge.invoke('selectPlaylistItem', _id!, {'index': index}),
       );
-      if (_wantsPlayback) await guarded(_bridge.invoke('play', _id!));
+      final requestedPlay = _effectivePlayback;
+      if (requestedPlay) await guarded(_bridge.invoke('play', _id!));
       await guarded(waiting);
       if (_disposed) throw StateError('Player disposed during selection.');
+      if (!_effectivePlayback && (requestedPlay || value.playing)) {
+        await guarded(_bridge.invoke('pause', _id!));
+      }
       value = value.copyWith(transitioning: false, clearError: true);
+      _armWatchdog();
     } catch (error) {
       if (_disposed) rethrow;
       final failure = _asError(error, value.engine);
@@ -284,6 +514,7 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState> {
         _fallbackUsed = true;
         await _start(LumioPlaybackEngine.webview, autoPlay: _wantsPlayback);
       } else {
+        _scheduleRecovery(failure);
         throw failure;
       }
     } finally {
@@ -292,26 +523,29 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState> {
     }
   }
 
-  Future<void> setEngine(LumioPlaybackEngine engine) => _serialize(() async {
-    _requestedEngine = engine;
-    _fallbackUsed = false;
-    if (_source == null) return;
-    final target = engine == LumioPlaybackEngine.automatic
-        ? LumioPlaybackEngine.native
-        : engine;
-    if (target == value.engine && value.initialized && value.error == null) {
-      return;
-    }
-    final previous = value;
-    await _start(
-      target,
-      autoPlay: _wantsPlayback,
-      position: previous.live ? Duration.zero : previous.position,
-    );
-  });
+  Future<void> setEngine(LumioPlaybackEngine engine) => _changePlayback(
+    () async {
+      _requestedEngine = engine;
+      _fallbackUsed = false;
+      if (_source == null) return;
+      final target = engine == LumioPlaybackEngine.automatic
+          ? LumioPlaybackEngine.native
+          : engine;
+      if (target == value.engine && value.initialized && value.error == null) {
+        return;
+      }
+      final previous = value;
+      await _start(
+        target,
+        autoPlay: _wantsPlayback,
+        position: previous.live ? Duration.zero : previous.position,
+      );
+    },
+  );
 
-  Future<void> retry() => _serialize(() async {
+  Future<void> retry() => _changePlayback(() async {
     if (_source == null) throw StateError('Open a source before retrying.');
+    _attempts = 0;
     final previous = value;
     _fallbackUsed = false;
     await _start(
@@ -327,7 +561,13 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState> {
     LumioPlaybackEngine engine, {
     required bool autoPlay,
     Duration position = Duration.zero,
+    bool recovering = false,
   }) async {
+    _watchdog?.cancel();
+    _watchdog = null;
+    _lastPosition = null;
+    _lastProgress = null;
+    _stableSince = null;
     await _release();
     if (_disposed) throw StateError('Player disposed during initialization.');
     final generation = ++_generation;
@@ -358,7 +598,9 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState> {
     unawaited(waiting.then<void>((_) {}, onError: (Object _, StackTrace _) {}));
     final config = {
       ...configuration.toMap(),
-      'autoPlay': autoPlay,
+      // Recovery starts paused: late native readiness cannot revive a paused
+      // request. Play is submitted only after readiness and a fresh intent check.
+      'autoPlay': autoPlay && _effectivePlayback && !recovering,
       'volume': _volume,
       'speed': _speed,
       'looping': _looping,
@@ -408,18 +650,29 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState> {
           }, generation),
         );
         var createAbandoned = false;
+        ++_pendingNativeCreations;
         final creation = _bridge.create();
         unawaited(
-          creation
-              .then<void>((created) async {
-                if (createAbandoned) {
-                  await _bridge.invoke(
-                    'dispose',
-                    (created['id'] as num).toInt(),
-                  );
-                }
-              })
-              .catchError((Object _) {}),
+          creation.then<void>(
+            (created) async {
+              --_pendingNativeCreations;
+              if (createAbandoned) {
+                ++_pendingLateReleases;
+                await _releaseStep(
+                  'late_native',
+                  LumioPlaybackEngine.native,
+                  () =>
+                      _bridge.invoke('dispose', (created['id'] as num).toInt()),
+                );
+                --_pendingLateReleases;
+              }
+              _maybeLogDisposed();
+            },
+            onError: (Object _, StackTrace _) {
+              --_pendingNativeCreations;
+              _maybeLogDisposed();
+            },
+          ),
         );
         late final Map<String, dynamic> created;
         try {
@@ -429,11 +682,16 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState> {
           rethrow;
         }
         if (_disposed || generation != _generation) {
-          await _bridge.invoke('dispose', (created['id'] as num).toInt());
+          await _releaseStep(
+            'abandoned_native',
+            LumioPlaybackEngine.native,
+            () => _bridge.invoke('dispose', (created['id'] as num).toInt()),
+          );
           throw StateError('Initialization cancelled.');
         }
         _id = (created['id'] as num).toInt();
         _textureId = (created['textureId'] as num).toInt();
+        config['autoPlay'] = autoPlay && _effectivePlayback && !recovering;
         _notifySurface();
         await guarded(
           _bridge.invoke(_playlist == null ? 'open' : 'openPlaylist', _id!, {
@@ -452,15 +710,23 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState> {
       if (_disposed || generation != _generation) {
         throw StateError('Initialization cancelled.');
       }
+      if (value.error != null) throw value.error!;
       if (position > Duration.zero && !value.live) {
         await _command('seek', {'positionMs': position.inMilliseconds});
       }
+      final resumeRecovery = recovering && autoPlay && _effectivePlayback;
+      if (resumeRecovery) await _command('play');
+      if (!_effectivePlayback &&
+          (config['autoPlay'] == true || resumeRecovery || value.playing)) {
+        await _command('pause');
+      }
       value = value.copyWith(transitioning: false, clearError: true);
+      _armWatchdog();
       _log(LumioLogLevel.info, 'ready', 'Media initialized.', engine: engine);
     } catch (error) {
       if (_disposed) rethrow;
       final failure = _asError(error, engine);
-      if (_canFallback(failure)) {
+      if (!recovering && _canFallback(failure)) {
         _fallbackUsed = true;
         _log(
           LumioLogLevel.warning,
@@ -488,6 +754,7 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState> {
           engine: engine,
         );
         await _release();
+        _scheduleRecovery(failure);
         throw failure;
       }
     } finally {
@@ -497,6 +764,15 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState> {
   }
 
   bool _canFallback(LumioPlayerError error) {
+    // Opt-in live recovery retries transient failures on the selected engine.
+    if (recovery.enabled &&
+        _wantsPlayback &&
+        _foreground &&
+        _source?.type == LumioSourceType.network &&
+        (configuration.mode == LumioPlaybackMode.live || value.live) &&
+        _temporaryError(error)) {
+      return false;
+    }
     if (_requestedEngine != LumioPlaybackEngine.automatic ||
         !configuration.allowAutomaticFallback ||
         _fallbackUsed ||
@@ -538,17 +814,22 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState> {
       } else if (!value.transitioning && _canFallback(error)) {
         _fallbackUsed = true;
         final previous = value;
+        final revision = _recoveryRevision;
         unawaited(
-          _serialize(
-            () => _start(
+          _serialize(() async {
+            if (generation != _generation || revision != _recoveryRevision) {
+              return;
+            }
+            await _start(
               LumioPlaybackEngine.webview,
               autoPlay: _wantsPlayback,
               position: previous.live ? Duration.zero : previous.position,
-            ),
-          ).catchError((Object _) {}),
+            );
+          }).catchError((Object _) {}),
         );
       } else {
         value = value.copyWith(error: error, buffering: false);
+        _scheduleRecovery(error);
       }
       _log(
         LumioLogLevel.error,
@@ -566,6 +847,8 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState> {
           index < playlist.items.length &&
           index != _playlistIndex;
       if (changed) {
+        _invalidateRecovery();
+        _attempts = 0;
         _playlistIndex = index;
         _source = playlist.items[index].source;
         _fallbackUsed = false;
@@ -608,26 +891,100 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState> {
               .whenComplete(() => _webAdvanceQueued = false),
         );
       }
+      if (!_effectivePlayback &&
+          value.transitioning &&
+          value.initialized &&
+          value.playing) {
+        unawaited(
+          _command('pause').catchError((Object error) {
+            if (!_disposed && generation == _generation) {
+              value = value.copyWith(error: _asError(error, value.engine));
+            }
+          }),
+        );
+      }
+      _observeProgress();
       if (value.initialized && _ready != null && !_ready!.isCompleted) {
         _ready!.complete();
       }
     }
   }
 
-  Future<void> play() => _serialize(() async {
-    await _command('play');
-    _wantsPlayback = true;
-  });
-  Future<void> pause() => _serialize(() async {
-    await _command('pause');
-    _wantsPlayback = false;
-  });
-  Future<void> seekTo(Duration position) => _serialize(() {
-    if (position.isNegative) {
-      throw ArgumentError('Seek position cannot be negative.');
+  /// [isCurrent] is checked when the command reaches the front of the queue,
+  /// before touching the engine. A stale command fails rather than succeeding
+  /// silently, so callers cannot mistake cancellation for completed playback.
+  Future<void> play({bool Function()? isCurrent}) {
+    final revision = isCurrent == null ? ++_intentRevision : _intentRevision;
+    if (isCurrent == null) _wantsPlayback = true;
+    return _serialize(() async {
+      _checkCurrent(isCurrent);
+      if (isCurrent != null) {
+        _wantsPlayback = true;
+        ++_intentRevision;
+      }
+      if (!_foreground && !configuration.allowBackgroundPlayback) return;
+      await _command('play');
+      // A later pause already owns intent; command completion must not undo it.
+      if (isCurrent == null && revision == _intentRevision) {
+        _wantsPlayback = true;
+      }
+      _armWatchdog();
+    });
+  }
+
+  /// Optional execution-time guard, with the same semantics as [play].
+  Future<void> pause({bool Function()? isCurrent}) {
+    if (isCurrent == null) {
+      _wantsPlayback = false;
+      ++_intentRevision;
+      _invalidateRecovery();
     }
-    return _command('seek', {'positionMs': position.inMilliseconds});
-  });
+    return _serialize(() async {
+      _checkCurrent(isCurrent);
+      if (isCurrent != null) {
+        _wantsPlayback = false;
+        ++_intentRevision;
+        _invalidateRecovery();
+      }
+      if (value.initialized) await _command('pause');
+    });
+  }
+
+  /// Optional execution-time guard, with the same semantics as [play].
+  Future<void> seekTo(Duration position, {bool Function()? isCurrent}) =>
+      _serialize(() {
+        _checkCurrent(isCurrent);
+        if (position.isNegative) {
+          throw ArgumentError('Seek position cannot be negative.');
+        }
+        return _command('seek', {'positionMs': position.inMilliseconds});
+      });
+
+  /// Seek used by scrubbing previews. Android waits for the renderer's first
+  /// frame callback, bounded by a native deadline; this is not a guarantee of
+  /// exact timestamp or Flutter texture composition. Other engines use seekTo.
+  Future<void> seekToPreview(Duration position, {bool Function()? isCurrent}) {
+    if (value.engine != LumioPlaybackEngine.native ||
+        defaultTargetPlatform != TargetPlatform.android) {
+      return seekTo(position, isCurrent: isCurrent);
+    }
+    return _serialize(() {
+      _checkCurrent(isCurrent);
+      if (position.isNegative) {
+        throw ArgumentError('Seek position cannot be negative.');
+      }
+      return _command('seek', {
+        'positionMs': position.inMilliseconds,
+        'waitForFrame': true,
+      });
+    });
+  }
+
+  void _checkCurrent(bool Function()? isCurrent) {
+    if (isCurrent != null && !isCurrent()) {
+      throw StateError('Player command is no longer current.');
+    }
+  }
 
   /// Seek to the live edge/default live position, if the media has a live window.
   Future<void> seekToLive() => _serialize(() {
@@ -716,6 +1073,7 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState> {
       );
       throw failure;
     }
+    if (_disposed) throw StateError('Player disposed during $method.');
   }
 
   Future<Map<String, dynamic>> diagnostics() async {
@@ -779,6 +1137,9 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState> {
         code: error.code,
         message: _redact(error.message ?? 'Native command failed.'),
         details: _redact(error.details?.toString() ?? ''),
+        recoverable:
+            error.details is Map &&
+            (error.details as Map)['recoverable'] == true,
         engine: engine,
       );
     }
@@ -817,10 +1178,17 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState> {
     String code,
     String message, {
     LumioPlaybackEngine? engine,
+    bool lifecycle = false,
   }) {
-    if (_disposed) return;
-    final entry = LumioLogEntry(level, code, _redact(message), engine: engine);
-    _logs.add(entry);
+    if (_disposed && !lifecycle) return;
+    final entry = LumioLogEntry(
+      level,
+      _redact(code),
+      _redact(message),
+      engine: engine,
+      playerId: playerId,
+    );
+    if (!_logs.isClosed) _logs.add(entry);
     try {
       logger?.call(entry);
     } catch (_) {
@@ -832,23 +1200,68 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState> {
     if (!_disposed) notifyListeners();
   }
 
+  Future<void> _releaseStep(
+    String resource,
+    LumioPlaybackEngine engine,
+    Future<Object?> Function() release,
+  ) async {
+    final watch = Stopwatch()..start();
+    _log(
+      LumioLogLevel.info,
+      'resources_release_started',
+      'Releasing $resource resources.',
+      engine: engine,
+      lifecycle: true,
+    );
+    try {
+      await release().timeout(const Duration(seconds: 5));
+      _log(
+        LumioLogLevel.info,
+        'resources_released',
+        '$resource cleanup acknowledged (${watch.elapsedMilliseconds} ms).',
+        engine: engine,
+        lifecycle: true,
+      );
+    } catch (error) {
+      _cleanupFailed = true;
+      final reason = error is TimeoutException ? 'timeout' : 'release error';
+      _log(
+        LumioLogLevel.warning,
+        'dispose_failed',
+        '$resource cleanup not confirmed: $reason. Continuing other cleanup steps.',
+        engine: engine,
+        lifecycle: true,
+      );
+    }
+  }
+
   Future<void> _release() async {
     ++_generation;
     final subscription = _subscription;
     final web = _web;
     final id = _id;
+    final engine = value.engine;
     _subscription = null;
     _web = null;
     _id = null;
     _textureId = null;
-    await subscription?.cancel();
-    try {
-      if (web != null) await web.dispose().timeout(const Duration(seconds: 5));
-      if (id != null) {
-        await _bridge.invoke('dispose', id).timeout(const Duration(seconds: 5));
-      }
-    } catch (error) {
-      _log(LumioLogLevel.warning, 'dispose_failed', _redact(error.toString()));
+    // Every resource gets its own attempt, even when an earlier release fails.
+    if (subscription != null) {
+      await _releaseStep('event_subscription', engine, subscription.cancel);
+    }
+    if (web != null) {
+      await _releaseStep(
+        'webview_media',
+        LumioPlaybackEngine.webview,
+        web.dispose,
+      );
+    }
+    if (id != null) {
+      await _releaseStep(
+        'native_player',
+        LumioPlaybackEngine.native,
+        () => _bridge.invoke('dispose', id),
+      );
     }
     _notifySurface();
   }
@@ -856,18 +1269,89 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState> {
   @override
   Future<void> dispose() {
     if (_disposal != null) return _disposal!;
+    final completion = Completer<void>();
+    _disposal = completion.future;
     _disposed = true;
+    WidgetsBinding.instance.removeObserver(this);
+    _invalidateRecovery();
+    _disposalWatch.start();
+    _log(
+      LumioLogLevel.info,
+      'dispose_started',
+      'Disposing player; rejecting new commands and invalidating engine events.',
+      engine: value.engine,
+      lifecycle: true,
+    );
     _cancelPending?.complete();
     if (_ready != null && !_ready!.isCompleted) {
       _ready!.completeError(StateError('Player disposed.'));
     }
     super.dispose();
-    return _disposal = _close();
+    unawaited(
+      _close().then(completion.complete, onError: completion.completeError),
+    );
+    return _disposal!;
+  }
+
+  void _maybeLogDisposed() {
+    if (!_closeFinished) return;
+    if (_cleanupFailed) {
+      if (!_incompleteLogged) {
+        _incompleteLogged = true;
+        _log(
+          LumioLogLevel.warning,
+          'dispose_incomplete',
+          'Player detached, but resource cleanup could not be fully confirmed.',
+          engine: value.engine,
+          lifecycle: true,
+        );
+      }
+      return;
+    }
+    if (_pendingNativeCreations != 0 ||
+        _pendingLateReleases != 0 ||
+        _disposedLogged) {
+      return;
+    }
+    _disposedLogged = true;
+    _disposalWatch.stop();
+    _log(
+      LumioLogLevel.info,
+      'disposed',
+      'Player disposal confirmed (${_disposalWatch.elapsedMilliseconds} ms): media resources released and engine callbacks invalidated.',
+      engine: value.engine,
+      lifecycle: true,
+    );
   }
 
   Future<void> _close() async {
     await _release();
-    await _queue;
+    try {
+      await _queue.timeout(const Duration(seconds: 5));
+    } catch (_) {
+      _cleanupFailed = true;
+      _log(
+        LumioLogLevel.warning,
+        'dispose_failed',
+        'Pending command completion not confirmed within the disposal deadline.',
+        engine: value.engine,
+        lifecycle: true,
+      );
+    }
+    _closeFinished = true;
+    if (_pendingNativeCreations != 0 || _pendingLateReleases != 0) {
+      _log(
+        LumioLogLevel.warning,
+        'dispose_pending',
+        'Player detached; waiting for late native creation cleanup. Confirmation will follow through the logger.',
+        engine: value.engine,
+        lifecycle: true,
+      );
+    }
+    _maybeLogDisposed();
+    _source = null;
+    _playlist = null;
+    _title = null;
     await _logs.close();
   }
 }

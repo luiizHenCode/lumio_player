@@ -6,6 +6,9 @@ import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
+import android.util.Log
+import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
@@ -18,6 +21,7 @@ import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.SeekParameters
 import androidx.media3.exoplayer.analytics.AnalyticsListener
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.source.MediaSource
@@ -84,7 +88,7 @@ class LumioPlayerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                     val created = try {
                         Instance(id, producer, engine.applicationContext)
                     } catch (error: Exception) {
-                        producer.release()
+                        runCatching { producer.release() }.exceptionOrNull()?.let { error.addSuppressed(it) }
                         throw error
                     }
                     players[id] = created
@@ -108,9 +112,17 @@ class LumioPlayerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                         "pause" -> instance.player.pause()
                         "seek" -> {
                             val position = args.requiredNonNegativeLong("positionMs")
+                            val waitForFrame = if (args.containsKey("waitForFrame")) args.requiredBoolean("waitForFrame") else false
+                            if (waitForFrame) {
+                                // The coordinator owns this Result, including synchronous failures.
+                                instance.previewSeek.seek(position, result)
+                                return
+                            }
+                            instance.previewSeek.cancel("Superseded by a regular seek")
                             instance.player.seekTo(position)
                         }
                         "seekToLive" -> {
+                            instance.previewSeek.cancel("Superseded by a live seek")
                             if (!instance.player.seekToLive()) {
                                 result.error("unsupported_live_seek", "The current media item is not live", mapOf("id" to instance.id))
                                 return
@@ -121,8 +133,8 @@ class LumioPlayerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                         "looping" -> instance.setLooping(args.requiredBoolean("looping"))
                         "dispose" -> {
                             players.remove(instance.id)
-                            instance.dispose()
                             if (players.isEmpty()) handler?.removeCallbacks(tick)
+                            instance.dispose()
                         }
                     }
                     if (call.method != "dispose") instance.emitState()
@@ -134,7 +146,12 @@ class LumioPlayerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             result.error("invalid_argument", error.message, null)
         } catch (error: Exception) {
             val details = mapOf("exception" to error.javaClass.name, "method" to call.method)
-            instance?.emitError("native_error", error.message ?: "Native playback operation failed", details, false)
+            instance?.let {
+                players.remove(it.id)
+                if (players.isEmpty()) handler?.removeCallbacks(tick)
+                runCatching { it.emitError("native_error", error.message ?: "Native playback operation failed", details, false) }
+                runCatching { it.dispose() }.exceptionOrNull()?.let { failure -> error.addSuppressed(failure) }
+            }
             result.error("native_error", error.message, details)
         }
     }
@@ -193,6 +210,14 @@ class LumioPlayerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     ) : Player.Listener, AnalyticsListener, TextureRegistry.SurfaceProducer.Callback {
         var player: ExoPlayer = buildPlayer(PlaybackConfig())
             private set
+        val previewSeek = PreviewSeekCoordinator(
+            player = { player },
+            schedule = { task, delay -> check(requireNotNull(handler).postDelayed(task, delay)) },
+            unschedule = { task -> handler?.removeCallbacks(task) },
+            nowMs = { SystemClock.elapsedRealtime() },
+            onTimeout = { Log.w("LumioPlayer", "Preview seek deadline reached for player $id; ACK is acceptance only") },
+                        trace = { message -> Log.d("LumioPlayer", "Player $id: $message") },
+        )
         private var released = false
         private var hasSource = false
         private var initialized = false
@@ -204,6 +229,8 @@ class LumioPlayerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                 private var loopPlaylist = false
         private var videoDecoderName: String? = null
         private var audioDecoderName: String? = null
+        private var audioPolicy = AudioPolicy.preserveHost
+        private var allowBackgroundPlayback = false
         private var enableDecoderFallback = true
         private var liveTargetOffsetMs: Long? = null
         var lastError: Map<String, Any?>? = null
@@ -217,7 +244,16 @@ class LumioPlayerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                 player.addAnalyticsListener(this)
                 player.setVideoSurface(producer.surface)
             } catch (error: Exception) {
-                player.release()
+                released = true
+                runCatching {
+                    cleanupAll(
+                        { producer.setCallback(null) },
+                        { player.removeListener(this) },
+                        { player.removeAnalyticsListener(this) },
+                        { player.clearVideoSurface() },
+                        { player.release() },
+                    )
+                }.exceptionOrNull()?.let { error.addSuppressed(it) }
                 throw error
             }
         }
@@ -230,7 +266,7 @@ class LumioPlayerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             val renderersFactory = DefaultRenderersFactory(context)
                 .setEnableDecoderFallback(config.enableDecoderFallback)
             return ExoPlayer.Builder(context, renderersFactory).setLooper(Looper.getMainLooper())
-                .setLoadControl(loadControl).build()
+                .setLoadControl(loadControl).build().also { it.applyAudioPolicy(config.audioPolicy) }
         }
 
         private fun prepareSource(source: Map<*, *>, config: PlaybackConfig): PreparedSource {
@@ -297,13 +333,13 @@ class LumioPlayerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             // Buffer configuration belongs to the player, so reopen replaces it without replacing the texture.
             val replacement = buildPlayer(config)
             try {
-                player.removeListener(this)
-                player.removeAnalyticsListener(this)
-                try {
-                    player.clearVideoSurface()
-                } finally {
-                    player.release()
-                }
+                previewSeek.sourceChanged()
+                cleanupAll(
+                    { player.removeListener(this) },
+                    { player.removeAnalyticsListener(this) },
+                    { player.clearVideoSurface() },
+                    { player.release() },
+                )
             } catch (error: Exception) {
                 runCatching { replacement.release() }
                 throw error
@@ -318,6 +354,8 @@ class LumioPlayerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             sourceFormat = prepared[request.index].format
             videoDecoderName = null
             audioDecoderName = null
+            audioPolicy = config.audioPolicy
+            allowBackgroundPlayback = config.allowBackgroundPlayback
             enableDecoderFallback = config.enableDecoderFallback
             liveTargetOffsetMs = config.liveTargetOffsetMs
             lastError = null
@@ -341,6 +379,7 @@ class LumioPlayerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         }
 
         private fun resetCurrentItem(index: Int) {
+            previewSeek.sourceChanged()
             initialized = false
             lastError = null
             sourceType = sources.getOrNull(index)?.type
@@ -372,7 +411,8 @@ class LumioPlayerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
         override fun onVideoSizeChanged(videoSize: VideoSize) {
             if (!released && videoSize.width > 0 && videoSize.height > 0) {
-                producer.setSize(videoSize.width, videoSize.height)
+                resizeAndBindVideoSurface(player, producer, videoSize.width, videoSize.height, surfaceAvailable)
+                Log.d("LumioPlayer", "Player $id: videoSize=${videoSize.width}x${videoSize.height}, surfaceAvailable=$surfaceAvailable")
             }
         }
 
@@ -428,6 +468,7 @@ class LumioPlayerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             playlistIndex: Int = player.currentMediaItemIndex,
         ) {
             if (released) return
+            previewSeek.cancel("Playback failed: $code")
             lastError = mapOf("id" to id, "type" to "error", "code" to code,
                 "message" to message, "details" to details, "recoverable" to recoverable,
                                 "playlistIndex" to playlistIndex, "playlistLength" to player.mediaItemCount)
@@ -461,6 +502,8 @@ class LumioPlayerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             "state" to state(),
             "textureId" to producer.id(),
             "surfaceAvailable" to surfaceAvailable,
+            "previewSeekPending" to previewSeek.isPending,
+            "previewSeekTimeoutCount" to previewSeek.timeoutCount,
             "handlesCropAndRotation" to producer.handlesCropAndRotation(),
             "sourceType" to sourceType,
             "sourceFormat" to sourceFormat,
@@ -479,6 +522,12 @@ class LumioPlayerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             "renderedVideoFrames" to player.videoDecoderCounters?.renderedOutputBufferCount,
             "videoDecoderName" to videoDecoderName,
             "audioDecoderName" to audioDecoderName,
+            "audioPolicy" to audioPolicy.name,
+            "allowBackgroundPlayback" to allowBackgroundPlayback,
+            "handlesAudioFocus" to (audioPolicy == AudioPolicy.exclusive),
+            "supportsCustomHeaders" to true,
+            "supportedAudioPolicies" to AudioPolicy.entries.map { it.name },
+            "backgroundPlaybackPolicy" to "Controller lifecycle opt-in; host platform support required. No background service or PiP is provided.",
             "enableDecoderFallback" to enableDecoderFallback,
             "liveTargetOffsetMs" to liveTargetOffsetMs,
             // Exception text can contain authenticated URLs or request headers.
@@ -490,19 +539,177 @@ class LumioPlayerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         fun dispose() {
             if (released) return
             released = true
-            try {
-                producer.setCallback(null)
-                player.removeListener(this)
-                player.removeAnalyticsListener(this)
-                player.clearVideoSurface()
-            } finally {
-                try {
-                    player.release()
-                } finally {
-                    producer.release()
-                }
+            sources = emptyList()
+            lastError = null
+            cleanupAll(
+                { previewSeek.sourceChanged() },
+                { producer.setCallback(null) },
+                { player.removeListener(this) },
+                { player.removeAnalyticsListener(this) },
+                { player.clearVideoSurface() },
+                { player.release() },
+                { producer.release() },
+            )
+        }
+    }
+}
+
+@UnstableApi
+internal fun resizeAndBindVideoSurface(
+    player: ExoPlayer,
+    producer: TextureRegistry.SurfaceProducer,
+    width: Int,
+    height: Int,
+    surfaceAvailable: Boolean,
+) {
+    if (width <= 0 || height <= 0 || (producer.width == width && producer.height == height)) return
+    producer.setSize(width, height)
+    // SurfaceProducer may replace its backing Surface on resize. Fetch only
+    // after setting the dimensions, and do not retain the previous Surface.
+    if (surfaceAvailable) player.setVideoSurface(producer.surface)
+}
+
+// Application-looper only. A successful ACK means a frame notification OR bounded acceptance,
+// not proof that Flutter has composited a frame at the exact requested presentation timestamp.
+@UnstableApi
+internal class PreviewSeekCoordinator(
+    private val player: () -> ExoPlayer,
+    private val schedule: (Runnable, Long) -> Unit,
+    private val unschedule: (Runnable) -> Unit,
+    private val nowMs: () -> Long,
+    private val onTimeout: () -> Unit,
+    private val trace: (String) -> Unit = {},
+) {
+    private var generation = 0L
+    private var pending: Pending? = null
+    val isPending: Boolean get() = pending != null
+    var timeoutCount = 0L
+        private set
+
+    private inner class Pending(
+        val player: ExoPlayer,
+        val result: MethodChannel.Result,
+        val generation: Long,
+        var startedMs: Long,
+        val previousParameters: SeekParameters,
+    ) {
+        var armed = false
+        var targetMs = 0L
+        val deadline = Runnable {
+            if (isCurrent(this)) {
+                timeoutCount++
+                runCatching { onTimeout() }
+                finish(this)
             }
         }
+        val listener = object : AnalyticsListener {
+            override fun onRenderedFirstFrame(
+                eventTime: AnalyticsListener.EventTime, output: Any, renderTimeMs: Long,
+            ) {
+                // Event time is generated on delivery, but renderTimeMs is captured by the
+                // renderer. Reject notifications already queued before this seek/source.
+                if (armed && isCurrent(this@Pending) && renderTimeMs > startedMs &&
+                    eventTime.windowIndex == player.currentMediaItemIndex &&
+                    eventTime.timeline == player.currentTimeline
+                ) {
+                    runCatching { trace("Preview frame callback: targetMs=$targetMs, elapsedMs=${nowMs() - startedMs}") }
+                    finish(this@Pending)
+                }
+            }
+
+            override fun onEvents(player: Player, events: AnalyticsListener.Events) {
+                completeAudioIfReady(this@Pending)
+            }
+        }
+    }
+
+    private fun isCurrent(request: Pending): Boolean =
+        pending === request && request.generation == generation
+
+    fun seek(positionMs: Long, result: MethodChannel.Result) {
+        if (pending != null) {
+            // Do not supersede an in-flight decode with another preview. The caller can
+            // coalesce positions and retry after the outstanding Future completes.
+            result.error("preview_seek_pending", "A preview seek is already pending", mapOf("recoverable" to true))
+            return
+        }
+        val request = try {
+            val current = player()
+            Pending(current, result, generation, nowMs(), current.seekParameters)
+        } catch (error: Exception) {
+            result.error("preview_seek_failed", error.message, mapOf("recoverable" to true))
+            return
+        }
+        pending = request
+        request.targetMs = positionMs
+        runCatching { trace("Preview seek requested: targetMs=$positionMs, fromMs=${request.player.currentPosition}") }
+        try {
+            request.player.addAnalyticsListener(request.listener)
+            schedule(request.deadline, 2_000L)
+            request.player.setSeekParameters(SeekParameters.EXACT)
+            request.player.seekTo(positionMs)
+            // Conservatively exclude notifications rendered before seekTo returned (including
+            // the same clock millisecond). A fast/no-op seek can use the bounded fallback.
+            request.startedMs = nowMs()
+            request.armed = true
+            completeAudioIfReady(request)
+        } catch (error: Exception) {
+            finish(request, "preview_seek_failed", error.message)
+        }
+    }
+
+    private fun completeAudioIfReady(request: Pending) {
+        if (!request.armed || !isCurrent(request)) return
+        val current = request.player
+        // Unknown/unprepared tracks must not be mistaken for audio-only video.
+        if (current.playbackState == Player.STATE_READY &&
+            current.currentTracks.isTypeSelected(C.TRACK_TYPE_AUDIO) &&
+            !current.currentTracks.isTypeSelected(C.TRACK_TYPE_VIDEO)
+        ) finish(request)
+    }
+
+    fun sourceChanged() {
+        generation++
+        cancel("The media source changed or the player was released")
+    }
+
+    fun cancel(message: String) {
+        pending?.let { finish(it, "cancelled", message) }
+    }
+
+    private fun finish(request: Pending, code: String? = null, message: String? = null) {
+        if (pending !== request) return
+        pending = null
+        val cleanupError = runCatching {
+            cleanupAll(
+                { unschedule(request.deadline) },
+                { request.player.removeAnalyticsListener(request.listener) },
+                { request.player.setSeekParameters(request.previousParameters) },
+            )
+        }.exceptionOrNull()
+        when {
+            code != null -> request.result.error(code, message, mapOf("recoverable" to true))
+            cleanupError != null -> request.result.error("preview_seek_failed", cleanupError.message, mapOf("recoverable" to true))
+            else -> request.result.success(null)
+        }
+    }
+}
+
+// Preserve the first failure without letting it skip independent resource releases.
+internal fun cleanupAll(vararg actions: () -> Unit) {
+    var failure: Exception? = null
+    actions.forEach { action ->
+        try {
+            action()
+        } catch (error: Exception) {
+            if (failure == null) failure = error
+            else if (failure !== error) failure?.addSuppressed(error)
+        }
+    }
+    failure?.let {
+        // Release failures are native failures, not caller argument validation errors.
+        if (it is IllegalArgumentException) throw IllegalStateException("Native resource cleanup failed", it)
+        throw it
     }
 }
 
@@ -590,6 +797,18 @@ internal fun validSpeed(value: Float): Float {
     return value
 }
 
+internal enum class AudioPolicy { preserveHost, mixWithOthers, exclusive }
+
+@UnstableApi
+internal fun ExoPlayer.applyAudioPolicy(policy: AudioPolicy) {
+    // Preserve Media3 defaults without touching the host AudioManager policy.
+    if (policy == AudioPolicy.preserveHost) return
+    setAudioAttributes(
+        AudioAttributes.Builder().setUsage(C.USAGE_MEDIA).setContentType(C.AUDIO_CONTENT_TYPE_MOVIE).build(),
+        policy == AudioPolicy.exclusive,
+    )
+}
+
 internal data class PlaybackConfig(
     val live: Boolean = false,
     val autoPlay: Boolean = false,
@@ -603,6 +822,8 @@ internal data class PlaybackConfig(
     val liveTargetOffsetMs: Long? = null,
     val enableDecoderFallback: Boolean = true,
     val loopPlaylist: Boolean = false,
+    val audioPolicy: AudioPolicy = AudioPolicy.preserveHost,
+    val allowBackgroundPlayback: Boolean = false,
 ) {
     companion object {
         fun parse(raw: Any?): PlaybackConfig {
@@ -635,6 +856,11 @@ internal data class PlaybackConfig(
                 },
                 enableDecoderFallback = boolean("enableDecoderFallback", true),
                 loopPlaylist = boolean("loopPlaylist", false),
+                audioPolicy = if (raw.containsKey("audioPolicy")) {
+                    AudioPolicy.entries.firstOrNull { it.name == raw["audioPolicy"] }
+                        ?: throw IllegalArgumentException("audioPolicy must be preserveHost, mixWithOthers, or exclusive")
+                } else AudioPolicy.preserveHost,
+                allowBackgroundPlayback = boolean("allowBackgroundPlayback", false),
             )
             require(config.bufferMinMs >= config.bufferPlaybackMs && config.bufferMinMs >= config.bufferRebufferMs) {
                 "bufferMinMs must be at least bufferPlaybackMs and bufferRebufferMs"

@@ -2,6 +2,13 @@ import AVFoundation
 import Flutter
 import UIKit
 
+func lumioConfigureAudioSession(_ policy: LumioAudioPolicy, session: AVAudioSession = .sharedInstance()) throws {
+  guard policy != .preserveHost else { return }
+  try session.setCategory(.playback, mode: .default,
+                          options: policy == .mixWithOthers ? [.mixWithOthers] : [])
+  // AVPlayer owns activation. The shared host session is never deactivated here.
+}
+
 // CADisplayLink retains its target; this proxy keeps the player disposable.
 private final class LumioDisplayTarget: NSObject {
   weak var owner: LumioNativePlayer?
@@ -16,10 +23,10 @@ final class LumioNativePlayer: NSObject, FlutterTexture {
   private let player = AVQueuePlayer()
   private var currentItemObservation: NSKeyValueObservation?
   private var rebuildingQueue = false
-  private var playlistURLs: [URL] = []
+  private var playlistSources: [LumioAssetSource] = []
   private var queuedIndices: [ObjectIdentifier: Int] = [:]
   private var playlistIndex = 0
-  var playlistLength: Int { playlistURLs.count }
+  var playlistLength: Int { playlistSources.count }
   private var item: AVPlayerItem?
   private var output: AVPlayerItemVideoOutput?
   private var observations: [NSKeyValueObservation] = []
@@ -73,7 +80,11 @@ final class LumioNativePlayer: NSObject, FlutterTexture {
   }
 
   func openPlaylist(urls: [URL], index: Int, configuration: LumioConfiguration) {
-    playlistURLs = urls
+    openPlaylist(sources: urls.map { LumioAssetSource(url: $0) }, index: index, configuration: configuration)
+  }
+
+  func openPlaylist(sources: [LumioAssetSource], index: Int, configuration: LumioConfiguration) {
+    playlistSources = sources
     self.configuration = configuration
     completed = false
     lastFailure = nil
@@ -101,8 +112,9 @@ final class LumioNativePlayer: NSObject, FlutterTexture {
     queuedIndices.removeAll()
     playlistIndex = index
     var previous: AVPlayerItem?
-    for position in index..<playlistURLs.count {
-      let queued = AVPlayerItem(asset: AVURLAsset(url: playlistURLs[position]))
+    for position in index..<playlistSources.count {
+      let source = playlistSources[position]
+      let queued = AVPlayerItem(asset: AVURLAsset(url: source.url, options: source.assetOptions))
       // This is a preference, not a hard maximum. AVPlayer owns buffering policy.
       queued.preferredForwardBufferDuration =
         (configuration.buffers["bufferMaxMs"] ?? configuration.buffers["bufferMinMs"] ?? 0) / 1000
@@ -127,7 +139,7 @@ final class LumioNativePlayer: NSObject, FlutterTexture {
     }
     playlistIndex = index
     // Keep the last item installed so completion, final position and replay work.
-    player.actionAtItemEnd = configuration.looping || index == playlistURLs.count - 1 ? .pause : .advance
+    player.actionAtItemEnd = configuration.looping || index == playlistSources.count - 1 ? .pause : .advance
     let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
       kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
       kCVPixelBufferIOSurfacePropertiesKey as String: [String: String]()
@@ -325,13 +337,13 @@ final class LumioNativePlayer: NSObject, FlutterTexture {
 
   func setLooping(_ value: Bool) {
     configuration.looping = value
-    player.actionAtItemEnd = value || playlistIndex == playlistURLs.count - 1 ? .pause : .advance
+    player.actionAtItemEnd = value || playlistIndex == playlistSources.count - 1 ? .pause : .advance
     emitState()
   }
 
   private func didEnd() {
     // Ordinary transitions are owned by AVQueuePlayer, never by Flutter.
-    if !configuration.looping && playlistIndex < playlistURLs.count - 1 { return }
+    if !configuration.looping && playlistIndex < playlistSources.count - 1 { return }
     if wantsPlayback && (configuration.looping || configuration.loopPlaylist) {
       rebuildQueue(index: configuration.looping ? playlistIndex : 0)
     } else {
@@ -467,7 +479,9 @@ final class LumioNativePlayer: NSObject, FlutterTexture {
       do {
         var result: [String: Any] = [:]
         for type in [AVMediaType.video, AVMediaType.audio] {
+          try Task.checkCancellation()
           let tracks = try await current.asset.loadTracks(withMediaType: type)
+          try Task.checkCancellation()
           guard let track = tracks.first else { continue }
           let descriptions = try await track.load(.formatDescriptions)
           if let description = descriptions.first {
@@ -512,7 +526,12 @@ final class LumioNativePlayer: NSObject, FlutterTexture {
       "liveTargetOffsetMs": configuration.liveTargetOffsetMs.map { $0 as Any } ?? NSNull(),
       "enableDecoderFallback": configuration.enableDecoderFallback.map { $0 as Any } ?? NSNull(),
       "unsupportedSettings": ["bufferPlaybackMs", "bufferRebufferMs", "liveTargetOffsetMs", "enableDecoderFallback"],
-      "supportsCustomHeaders": false, "supportedFormats": ["auto", "hls", "progressive"],
+      "supportsCustomHeaders": true, "supportedFormats": ["auto", "hls", "progressive"],
+      "httpHeaderPolicy": "Network AVURLAsset options per queue item; WebView fallback does not support headers.",
+      "audioPolicy": configuration.audioPolicy.rawValue,
+      "supportedAudioPolicies": LumioAudioPolicy.allCases.map { $0.rawValue },
+      "allowBackgroundPlayback": configuration.allowBackgroundPlayback,
+      "backgroundPlaybackPolicy": "Controller lifecycle opt-in; host platform support required. No background service or PiP is provided.",
       "audioSessionCategory": session.category.rawValue,
       "audioSessionMixesWithOthers": session.categoryOptions.contains(.mixWithOthers),
       "accessLog": accessLog, "errorLog": errorLog, "lastError": lastFailure ?? NSNull()
@@ -552,9 +571,14 @@ final class LumioNativePlayer: NSObject, FlutterTexture {
     player.pause()
     timer?.invalidate()
     timer = nil
+    // Task cancellation alone does not cancel AVAsset's in-flight metadata loads.
+    for queued in player.items() {
+      queued.cancelPendingSeeks()
+      queued.asset.cancelLoading()
+    }
     clearItem()
     player.removeAllItems()
-    playlistURLs.removeAll()
+    playlistSources.removeAll()
     queuedIndices.removeAll()
     lifecycleNotifications.forEach { NotificationCenter.default.removeObserver($0) }
     lifecycleNotifications.removeAll()

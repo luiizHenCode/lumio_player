@@ -3,7 +3,24 @@ const assert = require('node:assert/strict');
 const vm = require('node:vm');
 const fs = require('node:fs');
 
-function harness({nativeHls = false, hls = false} = {}) {
+test('HTML keeps viewport and centered media CSS inside a valid document structure', () => {
+  const html = fs.readFileSync(`${__dirname}/player.html`, 'utf8');
+  assert.equal((html.match(/<head>/g) || []).length, 1);
+  assert.equal((html.match(/<\/head>/g) || []).length, 1);
+  assert.equal((html.match(/<body>/g) || []).length, 1);
+  assert.equal((html.match(/<\/body>/g) || []).length, 1);
+  assert.match(html, /<head>\s*<meta charset="utf-8">/);
+  assert.match(html, /<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">/);
+  const head = html.match(/<head>([\s\S]*?)<\/head>/)[1];
+  assert.equal((head.match(/<style>/g) || []).length, 1);
+  assert.equal((head.match(/<\/style>/g) || []).length, 1);
+  const css = head.match(/<style>([\s\S]*?)<\/style>/)[1];
+  assert.match(css, /html,body\{margin:0;width:100%;height:100%;overflow:hidden;background:#000\}/);
+  assert.match(css, /video\{position:absolute;left:50%;top:50%;transform:translate\(-50%,-50%\);width:100%;height:100%;object-fit:contain;object-position:center\}/);
+  assert.match(html, /<\/head>\s*<body>\s*<video id="media" playsinline webkit-playsinline preload="auto"><\/video>\s*<script src="player.js"><\/script>\s*<\/body>/);
+});
+
+function harness({nativeHls = false, hls = false, destroyFails = false, pauseFails = false} = {}) {
   const events = [];
   let current;
   let interval;
@@ -18,10 +35,11 @@ function harness({nativeHls = false, hls = false} = {}) {
     addEventListener(name, fn) { (this.listeners[name] ||= []).push(fn); }
     emit(name) { for (const fn of this.listeners[name] || []) fn(); }
     cloneNode() { return new Media(); }
-    removeAttribute() {}
+    removeEventListener(name, fn) { this.listeners[name] = (this.listeners[name] || []).filter(listener => listener !== fn); }
+    removeAttribute(name) { if (name === 'src') { delete this.src; this.sourceRemoved = true; } }
     replaceWith(next) { current = next; }
-    load() {}
-    pause() { this.paused = true; }
+    load() { this.loads = (this.loads || 0) + 1; }
+    pause() { if (pauseFails && this.failPause) throw new Error('pause failed'); this.paused = true; }
     async play() { this.paused = false; }
     canPlayType() { return nativeHls ? 'maybe' : ''; }
   }
@@ -33,16 +51,20 @@ function harness({nativeHls = false, hls = false} = {}) {
     on(name, fn) { this.handlers[name] = fn; }
     loadSource(uri) { this.uri = uri; }
     attachMedia(media) { this.media = media; }
-    destroy() { this.destroyed = true; }
+    destroy() { this.destroyed = true; if (destroyFails) throw new Error('destroy failed'); }
   }
   current = new Media();
-  const window = {innerWidth: 800, innerHeight: 600, LumioBridge: {postMessage: s => events.push(JSON.parse(s))}};
+  const windowListeners = {};
+  const window = {innerWidth: 800, innerHeight: 600,
+    addEventListener: (name, fn) => { windowListeners[name] = fn; },
+    removeEventListener: (name, fn) => { if (windowListeners[name] === fn) delete windowListeners[name]; },
+    LumioBridge: {postMessage: s => events.push(JSON.parse(s))}};
   if (hls) window.Hls = Hls;
   vm.runInNewContext(fs.readFileSync(`${__dirname}/player.js`, 'utf8'), {
     window, document: {getElementById: () => current}, URL,
     setInterval: fn => { interval = fn; return 1; }, clearInterval: () => { interval = null; },
   });
-  return {events, window, Hls, media: () => current, interval: () => interval,
+  return {events, window, windowListeners, Hls, media: () => current, interval: () => interval,
     receive: (method, args = {}, request = 1) => window.LumioPlayer.receive({method, arguments: args, request})};
 }
 const source = {uri: 'https://example.com/private.m3u8?secret=token', format: 'hls',
@@ -125,6 +147,62 @@ test('fit modes update CSS and survive source changes and metadata loading', asy
   await h.receive('open', source);
   assert.equal(h.media().style.objectFit, 'scale-down');
   assert.equal(h.events.filter(e => e.type === 'state').at(-1).fit, 'scaleDown');
+});
+
+test('dispose acknowledges only after teardown and cancels pending open', async () => {
+  const h = harness({hls: true});
+  await h.receive('open', source, 10);
+  const media = h.media();
+  const engine = h.Hls.instance;
+  const post = h.window.LumioBridge.postMessage;
+  h.window.LumioBridge.postMessage = message => {
+    const event = JSON.parse(message);
+    if (event.type === 'ack' && event.request === 11) {
+      assert.equal(engine.destroyed, true);
+      assert.equal(media.paused, true);
+      assert.equal(media.sourceRemoved, true);
+      assert.equal(media.loads, 1);
+      assert.equal(Object.values(media.listeners).flat().length, 0);
+      assert.equal(h.windowListeners.resize, undefined);
+      assert.equal(h.interval(), null);
+    }
+    post(message);
+  };
+  await h.receive('dispose', {}, 11);
+  assert.deepEqual(h.events.filter(e => e.type === 'ack').map(e => [e.request, e.ok]), [[10, false], [11, true]]);
+  const count = h.events.length;
+  engine.handlers.level(null, {details: {live: true}});
+  media.emit('loadedmetadata');
+  await h.receive('dispose', {}, 12);
+  assert.equal(h.events.length, count);
+});
+
+test('dispose without request remains silent after metadata acknowledgment', async () => {
+  const h = harness({nativeHls: true});
+  await h.receive('open', source);
+  h.media().emit('loadedmetadata');
+  const count = h.events.length;
+  await h.window.LumioPlayer.receive({method: 'dispose'});
+  assert.equal(h.events.length, count);
+  assert.equal(h.interval(), null);
+});
+
+test('dispose attempts remaining resources after HLS destroy or media pause failure', async () => {
+  const h = harness({hls: true, destroyFails: true, pauseFails: true});
+  await h.receive('open', source);
+  const media = h.media();
+  media.failPause = true;
+  await h.receive('dispose', {}, 20);
+  assert.equal(h.Hls.instance.destroyed, true);
+  assert.equal(media.sourceRemoved, true);
+  assert.equal(media.loads, 1);
+  assert.equal(Object.values(media.listeners).flat().length, 0);
+  assert.equal(h.windowListeners.resize, undefined);
+  assert.equal(h.interval(), null);
+  assert.deepEqual(h.events.at(-1), {type: 'ack', request: 20, ok: false, code: 'command_failed'});
+  const count = h.events.length;
+  await h.receive('play');
+  assert.equal(h.events.length, count);
 });
 
 test('unsupported HLS and local sources fail explicitly; disposal stops events', async () => {

@@ -549,7 +549,7 @@ void main() {
         throwsUnsupportedError,
       );
       debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
-      expect(controller.capabilities.httpHeaders, isFalse);
+      expect(controller.capabilities.httpHeaders, isTrue);
       expect(
         controller.capabilities.formats,
         isNot(contains(LumioMediaFormat.dash)),

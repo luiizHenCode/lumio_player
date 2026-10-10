@@ -177,6 +177,8 @@ void main() {
         'speed': 1.0,
         'initializationTimeoutMs': 25000,
         'enableDecoderFallback': true,
+        'audioPolicy': 'preserveHost',
+        'allowBackgroundPlayback': false,
         ...defaults.buffer.toMap(),
       });
       const live = LumioPlayerConfiguration(

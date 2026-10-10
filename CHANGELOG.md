@@ -1,5 +1,18 @@
 # Changelog
 
+## Próxima versão — estabilidade e experiência de reprodução
+
+- Recuperação live de rede opt-in, com watchdog de posição, backoff limitado e cancelamento por intenção/lifecycle.
+- Políticas explícitas de áudio nativo (`preserveHost`, `mixWithOthers`, `exclusive`) e opt-in de background, sem serviço ou garantia de reprodução em background.
+- Headers HTTP por fonte/playlist no iOS via options de `AVURLAsset`, com ressalvas de propagação HLS/redirects documentadas.
+- Cleanup independente com deadlines, liberação de criações nativas tardias e logs correlacionados por player.
+- Controles completos/simplificados/live, fullscreen, gestos com feedback e layout compacto com progresso junto à borda.
+- Estado compacto compartilhável entre views/controllers, preservado em transições; toque para ocultar/exibir também com vídeo pausado e indicador de pausa no compacto.
+- Prévia durante scrubbing opt-in com coalescing, guards de ownership e retomada protegida; Android espera callback de frame com deadline e restaura parâmetros de seek.
+- Android reassocia a superfície após resize do `SurfaceProducer`; removido registro redundante das pastas Kotlin como fontes Java.
+- Teardown reforçado no Android/iOS/WebView, testes de regressão e checklist de validação física em `MOBILE_VALIDATION.md`.
+- Prévia Android confirmada pelo usuário após correção da superfície; isso não substitui matriz completa de dispositivos, testes de rede/áudio ou profiling.
+
 ## Próxima versão — enquadramento
 
 - BoxFit completo para textura nativa e WebView, incluindo contain, cover, fill, fitWidth/fitHeight, none e scaleDown.

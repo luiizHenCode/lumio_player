@@ -11,6 +11,7 @@
   let generation = 0;
   let autoplay = false;
   let requestedFit = 'contain';
+  let mediaListeners = [];
   const applyFit = () => {
     video.style.width = '100%';
     video.style.height = '100%';
@@ -27,12 +28,15 @@
     requestedFit = fit;
     applyFit();
   };
-  if (typeof window.addEventListener === 'function') window.addEventListener('resize', () => { if (!disposed) applyFit(); });
+  const onResize = () => { if (!disposed) applyFit(); };
+  if (typeof window.addEventListener === 'function') window.addEventListener('resize', onResize);
   const post = event => {
     if (!disposed) window.LumioBridge.postMessage(JSON.stringify(event));
   };
-  const ack = (request, ok, code) => {
-    if (request != null) post({type: 'ack', request, ok, code});
+  const ack = (request, ok, code, afterDispose = false) => {
+    if (request != null && (!disposed || afterDispose)) {
+      window.LumioBridge.postMessage(JSON.stringify({type: 'ack', request, ok, code}));
+    }
   };
   const error = (code, message, recoverable, details = {}) => {
     // Never forward browser/HLS messages, URLs, response bodies or headers.
@@ -75,6 +79,8 @@
     if (opening != null) ack(opening, false, 'open_cancelled');
     opening = null;
     if (hls) { hls.destroy(); hls = null; }
+    for (const remove of mediaListeners) remove();
+    mediaListeners = [];
     // New element isolates queued events from previous media resources.
     const old = video;
     const replacement = old.cloneNode(false);
@@ -98,9 +104,11 @@
     }
   };
   function bind(element, epoch) {
-    const listen = (name, callback) => element.addEventListener(name, () => {
-      if (!disposed && epoch === generation) callback();
-    });
+    const listen = (name, callback) => {
+      const handler = () => { if (!disposed && epoch === generation) callback(); };
+      element.addEventListener(name, handler);
+      mediaListeners.push(() => element.removeEventListener(name, handler));
+    };
     listen('loadedmetadata', () => {
       applyFit();
       initialized = true;
@@ -174,6 +182,34 @@
     }
     state();
   };
+  const dispose = request => {
+    disposed = true;
+    generation++;
+    let failed = false;
+    const attempt = action => { try { action(); } catch (_) { failed = true; } };
+    const pending = opening;
+    opening = null;
+    attempt(() => ack(pending, false, 'open_cancelled', true));
+    attempt(() => clearInterval(timer));
+    attempt(() => {
+      if (typeof window.removeEventListener === 'function') window.removeEventListener('resize', onResize);
+    });
+    const listeners = mediaListeners;
+    mediaListeners = [];
+    for (const remove of listeners) attempt(remove);
+    const engine = hls;
+    hls = null;
+    if (engine) attempt(() => engine.destroy());
+    const media = video;
+    attempt(() => media.pause());
+    attempt(() => media.removeAttribute('src'));
+    attempt(() => media.load());
+    video = null;
+    initialized = false;
+    buffering = false;
+    // Acknowledge disposal only after every independent teardown attempt.
+    ack(request, !failed, failed ? 'command_failed' : undefined, true);
+  };
   const receive = async payload => {
     if (disposed) return;
     const {request, method, arguments: args = {}} = payload;
@@ -197,7 +233,7 @@
         case 'speed': video.playbackRate = args.value; break;
         case 'looping': video.loop = args.value; break;
         case 'reset': reset(); break;
-        case 'dispose': reset(); clearInterval(timer); disposed = true; return;
+        case 'dispose': dispose(request); return;
         default: throw new Error('unsupported_command');
       }
       state();

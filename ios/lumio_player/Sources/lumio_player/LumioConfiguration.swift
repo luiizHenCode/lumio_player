@@ -31,7 +31,43 @@ func lumioPlaylistIndex(_ map: [String: Any], length: Int) throws -> Int {
   return Int(value)
 }
 
+enum LumioAudioPolicy: String, CaseIterable {
+  case preserveHost, mixWithOthers, exclusive
+}
+
+// Keep validation independent of AVFoundation so malformed channel input can be
+// tested on the host. Never include header names or values in failures.
+func lumioHTTPHeaders(_ source: [String: Any]) throws -> [String: String] {
+  guard let raw = source["headers"], !(raw is NSNull) else { return [:] }
+  guard let headers = raw as? [String: String] else {
+    throw LumioFailure("invalid_argument", "source.headers must be a string-to-string map.")
+  }
+  guard headers.isEmpty || source["type"] as? String == "network" else {
+    throw LumioFailure("invalid_argument", "HTTP headers require a network source.")
+  }
+  let token = Set("!#$%&'*+-.^_`|~0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ".utf8)
+  var names = Set<String>()
+  for (name, value) in headers {
+    guard !name.isEmpty, name.utf8.allSatisfy({ token.contains($0) }),
+          value.unicodeScalars.allSatisfy({ $0.value >= 32 && $0.value != 127 || $0.value == 9 }),
+          names.insert(name.lowercased()).inserted else {
+      throw LumioFailure("invalid_argument", "HTTP headers contain an invalid field or duplicate name.")
+    }
+  }
+  return headers
+}
+
+struct LumioAssetSource {
+  let url: URL
+  var headers: [String: String] = [:]
+  var assetOptions: [String: Any]? {
+    headers.isEmpty ? nil : ["AVURLAssetHTTPHeaderFieldsKey": headers]
+  }
+}
+
 struct LumioConfiguration {
+  var audioPolicy = LumioAudioPolicy.preserveHost
+  var allowBackgroundPlayback = false
   var live = false
   var autoPlay = false
   var looping = false
@@ -43,7 +79,13 @@ struct LumioConfiguration {
   var enableDecoderFallback: Bool?
 
   init(_ map: [String: Any]) throws {
-    for key in ["live", "autoPlay", "looping", "loopPlaylist"] where map[key] != nil {
+    if let raw = map["audioPolicy"] {
+      guard let name = raw as? String, let policy = LumioAudioPolicy(rawValue: name) else {
+        throw LumioFailure("invalid_argument", "audioPolicy must be preserveHost, mixWithOthers, or exclusive.")
+      }
+      audioPolicy = policy
+    }
+    for key in ["live", "autoPlay", "looping", "loopPlaylist", "allowBackgroundPlayback"] where map[key] != nil {
       guard let value = map[key] as? NSNumber, CFGetTypeID(value) == CFBooleanGetTypeID() else {
         throw LumioFailure("invalid_argument", "\(key) must be a boolean.")
       }
@@ -51,6 +93,7 @@ struct LumioConfiguration {
       case "live": live = value.boolValue
       case "autoPlay": autoPlay = value.boolValue
       case "looping": looping = value.boolValue
+      case "allowBackgroundPlayback": allowBackgroundPlayback = value.boolValue
       default: loopPlaylist = value.boolValue
       }
     }

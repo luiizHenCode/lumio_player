@@ -4,6 +4,18 @@ enum LumioPlaybackEngine { automatic, native, webview }
 
 enum LumioPlaybackMode { video, audio, live }
 
+/// Native audio policy. Explicit policies affect the shared iOS audio session.
+enum LumioAudioPolicy {
+  /// Leave the host audio session unchanged and do not request Android focus.
+  preserveHost,
+
+  /// Mix with other audio without requesting exclusive Android audio focus.
+  mixWithOthers,
+
+  /// Use iOS playback without mixing and Android Media3-managed audio focus.
+  exclusive,
+}
+
 enum LumioSourceType { network, file, asset }
 
 enum LumioMediaFormat { auto, hls, dash, progressive, rtsp }
@@ -115,6 +127,8 @@ class LumioPlayerConfiguration {
   const LumioPlayerConfiguration({
     this.engine = LumioPlaybackEngine.automatic,
     this.mode = LumioPlaybackMode.video,
+    this.audioPolicy = LumioAudioPolicy.preserveHost,
+    this.allowBackgroundPlayback = false,
     this.autoPlay = true,
     this.looping = false,
     this.volume = 1,
@@ -127,6 +141,11 @@ class LumioPlayerConfiguration {
   });
   final LumioPlaybackEngine engine;
   final LumioPlaybackMode mode;
+  final LumioAudioPolicy audioPolicy;
+
+  /// Opt out of controller lifecycle pausing. The host must provide platform
+  /// background support; this does not create a background service or PiP.
+  final bool allowBackgroundPlayback;
   final bool autoPlay, looping, allowAutomaticFallback;
   final double volume, speed;
   final Duration initializationTimeout;
@@ -156,6 +175,8 @@ class LumioPlayerConfiguration {
 
   Map<String, Object?> toMap() => {
     'live': mode == LumioPlaybackMode.live,
+    'audioPolicy': audioPolicy.name,
+    'allowBackgroundPlayback': allowBackgroundPlayback,
     'autoPlay': autoPlay,
     'looping': looping,
     'volume': volume,
@@ -185,15 +206,23 @@ class LumioPlayerError implements Exception {
 }
 
 class LumioLogEntry {
-  LumioLogEntry(this.level, this.code, this.message, {this.engine})
-    : timestamp = DateTime.now();
+  LumioLogEntry(
+    this.level,
+    this.code,
+    this.message, {
+    this.engine,
+    this.playerId,
+  }) : timestamp = DateTime.now();
   final DateTime timestamp;
   final LumioLogLevel level;
   final String code, message;
   final LumioPlaybackEngine? engine;
+
+  /// Correlates controller logs across screen transitions without exposing media URLs.
+  final int? playerId;
   @override
   String toString() =>
-      '[Lumio/${level.name}/${engine?.name ?? 'controller'}] $code: $message';
+      '[Lumio/${level.name}/${engine?.name ?? 'controller'}${playerId == null ? '' : '/player-$playerId'}] $code: $message';
 }
 
 typedef LumioLogger = void Function(LumioLogEntry entry);

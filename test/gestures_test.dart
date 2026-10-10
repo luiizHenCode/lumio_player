@@ -7,6 +7,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:lumio_player/src/controls_configuration.dart';
 import 'package:lumio_player/src/controller.dart';
 import 'package:lumio_player/src/models.dart';
+import 'package:lumio_player/src/player_view.dart' show LumioPlayerControls;
 
 import 'controller_test.dart' show NativeMock;
 import 'player_view_test.dart' show TestController, close, host;
@@ -29,7 +30,7 @@ class DelayedSpeedController extends TestController {
   Future<void> setSpeed(double speed) {
     speeds.add(speed);
     final result = _queue.then((_) async {
-      if (speed == 2) await boost.future;
+      if (speed == 1) await boost.future;
       value = value.copyWith(speed: speed);
     });
     _queue = result;
@@ -85,7 +86,7 @@ class SpeedNativeMock extends NativeMock {
       }
     } else if (call.method == 'speed') {
       speed = (args['speed'] as num).toDouble();
-      if (speed == 2 && boostGate != null) await boostGate!.future;
+      if (speed == 1 && boostGate != null) await boostGate!.future;
     }
     return super.respond(call);
   }
@@ -103,6 +104,455 @@ class SpeedNativeMock extends NativeMock {
 }
 
 void main() {
+  final compactControls = find.byKey(const ValueKey('lumio-compact-controls'));
+  final progress = find.byKey(const ValueKey('lumio-progress'));
+
+  for (final placement in LumioControlsPlacement.values) {
+    for (final liveOrigin in ['state', 'mode', 'layout']) {
+      testWidgets(
+        '$placement live from $liveOrigin toggles compact without double-tap delay',
+        (tester) async {
+          final controller =
+              TestController(
+                  configuration: LumioPlayerConfiguration(
+                    mode: liveOrigin == 'mode'
+                        ? LumioPlaybackMode.live
+                        : LumioPlaybackMode.video,
+                  ),
+                )
+                ..value = LumioPlayerState(
+                  initialized: true,
+                  playing: true,
+                  live: liveOrigin == 'state',
+                );
+          await tester.pumpWidget(
+            host(
+              controller,
+              width: 390,
+              configuration: LumioControlsConfiguration(
+                placement: placement,
+                layout: liveOrigin == 'layout'
+                    ? LumioControlsLayout.live
+                    : LumioControlsLayout.automatic,
+                compact: true,
+                enableZoom: true,
+              ),
+            ),
+          );
+          final surface = find.byKey(surfaceKey);
+          final detector = tester.widget<GestureDetector>(surface);
+          expect(detector.onDoubleTapDown, isNull);
+          expect(detector.onDoubleTap, isNull);
+          expect(detector.onLongPressStart, isNull);
+          expect(detector.onLongPressEnd, isNull);
+          final point = tester.getRect(surface).topCenter + const Offset(0, 24);
+          await tester.tapAt(point);
+          await tester.pump();
+          expect(
+            tester
+                .widget<LumioPlayerControls>(find.byType(LumioPlayerControls))
+                .compacted,
+            true,
+          );
+          await tester.tapAt(
+            tester.getRect(surface).topCenter + const Offset(0, 24),
+          );
+          await tester.pump();
+          expect(
+            tester
+                .widget<LumioPlayerControls>(find.byType(LumioPlayerControls))
+                .compacted,
+            false,
+          );
+          expect(controller.speeds, isEmpty);
+          expect(controller.sought, isNull);
+          await close(tester, controller);
+        },
+      );
+    }
+    testWidgets('$placement default compact deadline is exactly five seconds', (
+      tester,
+    ) async {
+      final controller = TestController()
+        ..value = const LumioPlayerState(initialized: true, playing: true);
+      await tester.pumpWidget(
+        host(
+          controller,
+          configuration: LumioControlsConfiguration(
+            placement: placement,
+            compact: true,
+          ),
+        ),
+      );
+      await tester.pump(const Duration(milliseconds: 4999));
+      expect(progress, findsOneWidget);
+      expect(compactControls, findsNothing);
+      await tester.pump(const Duration(milliseconds: 1));
+      expect(progress, findsNothing);
+      expect(compactControls, findsOneWidget);
+      await close(tester, controller);
+    });
+
+    testWidgets(
+      '$placement single tap toggles visible compact visible and restarts deadline',
+      (tester) async {
+        final controller = TestController()
+          ..value = const LumioPlayerState(initialized: true, playing: true);
+        await tester.pumpWidget(
+          host(
+            controller,
+            configuration: LumioControlsConfiguration(
+              placement: placement,
+              compact: true,
+            ),
+          ),
+        );
+        expect(progress, findsOneWidget);
+        await tester.tapAt(
+          tester.getTopLeft(find.byKey(surfaceKey)) + const Offset(30, 20),
+        );
+        await tester.pump(const Duration(milliseconds: 350));
+        expect(compactControls, findsOneWidget);
+        await tester.tapAt(
+          tester.getTopLeft(find.byKey(surfaceKey)) + const Offset(30, 20),
+        );
+        await tester.pump(const Duration(milliseconds: 350));
+        expect(progress, findsOneWidget);
+        expect(compactControls, findsNothing);
+        // onTap resolves 300 ms after pointer-up; 50 ms of its new timer elapsed.
+        await tester.pump(const Duration(milliseconds: 4949));
+        expect(progress, findsOneWidget);
+        await tester.pump(const Duration(milliseconds: 1));
+        expect(compactControls, findsOneWidget);
+        await close(tester, controller);
+      },
+    );
+
+    testWidgets('$placement compact disabled never toggles or auto-hides', (
+      tester,
+    ) async {
+      final controller = TestController()
+        ..value = const LumioPlayerState(initialized: true, playing: true);
+      await tester.pumpWidget(
+        host(
+          controller,
+          configuration: LumioControlsConfiguration(placement: placement),
+        ),
+      );
+      for (var i = 0; i < 2; i++) {
+        await tester.tapAt(
+          tester.getTopLeft(find.byKey(surfaceKey)) + const Offset(30, 20),
+        );
+        await tester.pump(const Duration(milliseconds: 350));
+        expect(progress, findsOneWidget);
+        expect(compactControls, findsNothing);
+      }
+      await tester.pump(const Duration(seconds: 6));
+      expect(progress, findsOneWidget);
+      await close(tester, controller);
+    });
+
+    testWidgets('$placement controls clicks do not toggle the surface', (
+      tester,
+    ) async {
+      final controller = TestController()
+        ..value = const LumioPlayerState(initialized: true, playing: true);
+      await tester.pumpWidget(
+        host(
+          controller,
+          configuration: LumioControlsConfiguration(
+            placement: placement,
+            compact: true,
+          ),
+        ),
+      );
+      await tester.tap(find.byTooltip('Mute'));
+      await tester.pump(const Duration(milliseconds: 350));
+      expect(controller.value.volume, 0);
+      expect(progress, findsOneWidget);
+      expect(compactControls, findsNothing);
+      expect(controller.sought, isNull);
+      expect(controller.speeds, isEmpty);
+      await tester.pump(const Duration(seconds: 5));
+      expect(compactControls, findsOneWidget);
+      await tester.tap(compactControls);
+      await tester.pump(const Duration(milliseconds: 350));
+      expect(progress, findsOneWidget);
+      expect(compactControls, findsNothing);
+      await close(tester, controller);
+    });
+
+    testWidgets(
+      '$placement double tap seeks without single tap compact toggle',
+      (tester) async {
+        final controller = TestController()
+          ..value = const LumioPlayerState(
+            initialized: true,
+            playing: true,
+            duration: Duration(minutes: 1),
+          );
+        await tester.pumpWidget(
+          host(
+            controller,
+            configuration: LumioControlsConfiguration(
+              placement: placement,
+              compact: true,
+            ),
+          ),
+        );
+        for (final initiallyHidden in [false, true]) {
+          if (initiallyHidden) {
+            await tester.pump(const Duration(seconds: 5));
+            expect(compactControls, findsOneWidget);
+          }
+          await doubleTap(
+            tester,
+            tester.getTopRight(find.byKey(surfaceKey)) + const Offset(-30, 20),
+          );
+          expect(controller.sought, const Duration(seconds: 10));
+          expect(progress, findsOneWidget);
+          expect(compactControls, findsNothing);
+        }
+        await close(tester, controller);
+      },
+    );
+
+    testWidgets('$placement hold and pinch reveal without compact toggle', (
+      tester,
+    ) async {
+      final controller = TestController()
+        ..value = const LumioPlayerState(initialized: true, playing: true);
+      await tester.pumpWidget(
+        host(
+          controller,
+          width: 600,
+          configuration: LumioControlsConfiguration(
+            placement: placement,
+            compact: true,
+            enableZoom: true,
+          ),
+        ),
+      );
+      await tester.pump(const Duration(seconds: 5));
+      expect(compactControls, findsOneWidget);
+      final gesture = await tester.startGesture(
+        tester.getCenter(find.byKey(surfaceKey)),
+      );
+      await tester.pump(kLongPressTimeout + const Duration(milliseconds: 20));
+      expect(controller.value.speed, 2);
+      await gesture.up();
+      await tester.pump(const Duration(milliseconds: 350));
+      expect(controller.value.speed, 1);
+      expect(progress, findsOneWidget);
+      expect(compactControls, findsNothing);
+      await pinch(tester);
+      await tester.pump(const Duration(milliseconds: 350));
+      expect(zoom(tester), greaterThan(1));
+      expect(progress, findsOneWidget);
+      expect(compactControls, findsNothing);
+      await close(tester, controller);
+    });
+  }
+
+  testWidgets(
+    'ready paused media toggles and stays hidden across paused state updates',
+    (tester) async {
+      final controller = TestController()
+        ..value = const LumioPlayerState(initialized: true);
+      await tester.pumpWidget(
+        host(
+          controller,
+          configuration: const LumioControlsConfiguration(compact: true),
+        ),
+      );
+      await tester.pump(const Duration(seconds: 6));
+      expect(progress, findsOneWidget);
+      await tester.tap(find.byKey(surfaceKey));
+      await tester.pump(const Duration(milliseconds: 350));
+      expect(compactControls, findsOneWidget);
+      await tester.pump(const Duration(seconds: 6));
+      expect(compactControls, findsOneWidget);
+      controller.value = controller.value.copyWith(
+        position: const Duration(seconds: 1),
+      );
+      await tester.pump();
+      expect(compactControls, findsOneWidget);
+      await tester.tap(find.byKey(surfaceKey));
+      await tester.pump(const Duration(milliseconds: 350));
+      expect(progress, findsOneWidget);
+      await tester.tap(find.byKey(surfaceKey));
+      await tester.pump(const Duration(milliseconds: 350));
+      expect(compactControls, findsOneWidget);
+      controller.value = controller.value.copyWith(playing: true);
+      await tester.pump();
+      expect(compactControls, findsOneWidget);
+      await close(tester, controller);
+    },
+  );
+
+  for (final state in [
+    const LumioPlayerState(),
+    const LumioPlayerState(initialized: true, transitioning: true),
+    const LumioPlayerState(initialized: true, playing: true, buffering: true),
+    const LumioPlayerState(
+      initialized: true,
+      playing: true,
+      error: LumioPlayerError(code: 'test', message: 'Failure'),
+    ),
+  ]) {
+    testWidgets('unready or buffering media remains visible on tap: $state', (
+      tester,
+    ) async {
+      final controller = TestController()..value = state;
+      await tester.pumpWidget(
+        host(
+          controller,
+          configuration: const LumioControlsConfiguration(compact: true),
+        ),
+      );
+      await tester.tap(find.byKey(surfaceKey));
+      await tester.pump(const Duration(milliseconds: 350));
+      await tester.pump(const Duration(seconds: 6));
+      expect(compactControls, findsNothing);
+      expect(progress, findsOneWidget);
+      await close(tester, controller);
+    });
+  }
+
+  testWidgets('buffering preserves compact controls and errors reveal them', (
+    tester,
+  ) async {
+    final controller = TestController()
+      ..value = const LumioPlayerState(initialized: true, playing: true);
+    await tester.pumpWidget(
+      host(
+        controller,
+        configuration: const LumioControlsConfiguration(compact: true),
+      ),
+    );
+    await tester.pump(const Duration(seconds: 5));
+    expect(compactControls, findsOneWidget);
+    controller.value = controller.value.copyWith(buffering: true);
+    await tester.pump(const Duration(seconds: 6));
+    expect(compactControls, findsOneWidget);
+    controller.value = controller.value.copyWith(buffering: false);
+    await tester.pump(const Duration(seconds: 5));
+    expect(compactControls, findsOneWidget);
+    controller.value = controller.value.copyWith(
+      error: const LumioPlayerError(code: 'test', message: 'Failure'),
+    );
+    await tester.pump(const Duration(seconds: 6));
+    expect(compactControls, findsNothing);
+    expect(find.byTooltip('Retry'), findsOneWidget);
+    await close(tester, controller);
+  });
+
+  final holdOverlay = find.byKey(const ValueKey('lumio-hold-speed-label'));
+
+  for (final (speed, target) in [
+    (1.0, 2.0),
+    (2.0, 1.0),
+    (3.0, 1.0),
+    (4.0, 1.0),
+  ]) {
+    for (final cancel in [false, true]) {
+      testWidgets('hold $speed → $target restores on cancel=$cancel', (
+        tester,
+      ) async {
+        final controller = TestController()
+          ..value = LumioPlayerState(initialized: true, speed: speed);
+        await tester.pumpWidget(host(controller));
+        expect(holdOverlay, findsNothing);
+        final gesture = await tester.startGesture(
+          tester.getCenter(find.byKey(surfaceKey)),
+        );
+        await tester.pump(kLongPressTimeout + const Duration(milliseconds: 20));
+        expect(controller.speeds, [target]);
+        expect(controller.value.speed, target);
+        expect(holdOverlay, findsOneWidget);
+        expect(tester.widget<Text>(holdOverlay).data, '${target.toInt()}x');
+        if (cancel) {
+          await gesture.cancel();
+        } else {
+          await gesture.up();
+        }
+        await tester.pump();
+        expect(controller.speeds, [target, speed]);
+        expect(controller.value.speed, speed);
+        expect(holdOverlay, findsNothing);
+        await close(tester, controller);
+      });
+    }
+  }
+
+  for (final speed in [1.5, .75]) {
+    for (final cancel in [false, true]) {
+      testWidgets('custom $speed does not start hold on cancel=$cancel', (
+        tester,
+      ) async {
+        final controller = TestController()
+          ..value = LumioPlayerState(initialized: true, speed: speed);
+        await tester.pumpWidget(host(controller));
+        final gesture = await tester.startGesture(
+          tester.getCenter(find.byKey(surfaceKey)),
+        );
+        await tester.pump(kLongPressTimeout + const Duration(milliseconds: 20));
+        expect(controller.speeds, isEmpty);
+        expect(controller.value.speed, speed);
+        expect(holdOverlay, findsNothing);
+        if (cancel) {
+          await gesture.cancel();
+        } else {
+          await gesture.up();
+        }
+        await tester.pump();
+        expect(controller.speeds, isEmpty);
+        expect(controller.value.speed, speed);
+        expect(holdOverlay, findsNothing);
+        await close(tester, controller);
+      });
+    }
+  }
+
+  for (final speed in [1.0, 2.0, 3.0, 4.0, 1.5, .75]) {
+    for (final cancel in [false, true]) {
+      testWidgets('custom holdSpeed 3 from $speed on cancel=$cancel', (
+        tester,
+      ) async {
+        final controller = TestController()
+          ..value = LumioPlayerState(initialized: true, speed: speed);
+        await tester.pumpWidget(
+          host(
+            controller,
+            configuration: const LumioControlsConfiguration(holdSpeed: 3),
+          ),
+        );
+        final gesture = await tester.startGesture(
+          tester.getCenter(find.byKey(surfaceKey)),
+        );
+        await tester.pump(kLongPressTimeout + const Duration(milliseconds: 20));
+        final eligible = speed == 1 || speed >= 2;
+        final target = speed == 1 ? 3.0 : 1.0;
+        expect(controller.speeds, eligible ? [target] : isEmpty);
+        expect(controller.value.speed, eligible ? target : speed);
+        expect(holdOverlay, eligible ? findsOneWidget : findsNothing);
+        if (eligible) {
+          expect(tester.widget<Text>(holdOverlay).data, '${target.toInt()}x');
+        }
+        if (cancel) {
+          await gesture.cancel();
+        } else {
+          await gesture.up();
+        }
+        await tester.pump();
+        expect(controller.speeds, eligible ? [target, speed] : isEmpty);
+        expect(controller.value.speed, speed);
+        expect(holdOverlay, findsNothing);
+        await close(tester, controller);
+      });
+    }
+  }
+
   for (final delayedBoost in [false, true]) {
     testWidgets(
       'real native auto-advance restores persistent hold rate (delayed=$delayedBoost)',
@@ -112,7 +562,7 @@ void main() {
         final controller = LumioPlayerController(
           configuration: const LumioPlayerConfiguration(
             engine: LumioPlaybackEngine.native,
-            speed: 1.5,
+            speed: 3,
           ),
         );
         await tester.pumpWidget(host(controller));
@@ -142,8 +592,8 @@ void main() {
         });
         await tester.pump();
         expect(controller.value.playing, true);
-        expect(controller.value.speed, delayedBoost ? 1.5 : 2);
-        expect(native.speed, 2);
+        expect(controller.value.speed, delayedBoost ? 3 : 1);
+        expect(native.speed, 1);
         await tester.runAsync(() async {
           await native.advance(1);
           await Future<void>.delayed(Duration.zero);
@@ -157,11 +607,11 @@ void main() {
           await Future<void>.delayed(Duration.zero);
         });
         await tester.pump();
-        expect(controller.value.speed, 1.5);
-        expect(native.speed, 1.5);
+        expect(controller.value.speed, 3);
+        expect(native.speed, 3);
         expect(
           native.named('speed').map((call) => (call.arguments as Map)['speed']),
-          [2, 1.5],
+          [1, 3],
         );
         // Reopening an engine/source must also use the restored controller-global rate.
         await tester.runAsync(
@@ -170,11 +620,78 @@ void main() {
         await tester.pump();
         expect(
           (native.named('open').last.arguments as Map)['config']['speed'],
-          1.5,
+          3,
         );
         await tester.pumpWidget(const SizedBox.shrink());
         await tester.pump(const Duration(milliseconds: 350));
         await tester.runAsync(controller.dispose);
+      },
+    );
+  }
+
+  for (final delayedBoost in [false, true]) {
+    testWidgets(
+      'real native revision preserves explicit 1x after hold (delayed=$delayedBoost)',
+      (tester) async {
+        final native = SpeedNativeMock()..install();
+        addTearDown(native.uninstall);
+        final controller = LumioPlayerController(
+          configuration: const LumioPlayerConfiguration(
+            engine: LumioPlaybackEngine.native,
+            speed: 3,
+          ),
+        );
+        await tester.pumpWidget(host(controller));
+        await tester.runAsync(
+          () => controller.openPlaylist(
+            LumioPlaylist([
+              LumioPlaylistItem(source: LumioSource.asset('first.mp4')),
+            ]),
+          ),
+        );
+        await tester.pump();
+        if (delayedBoost) native.boostGate = Completer<void>();
+        final gesture = await tester.startGesture(
+          tester.getCenter(find.byKey(surfaceKey)),
+        );
+        await tester.pump(kLongPressTimeout + const Duration(milliseconds: 20));
+        await tester.runAsync(() => Future<void>.delayed(Duration.zero));
+        await tester.pump();
+        expect(native.speed, 1);
+        expect(controller.value.speed, delayedBoost ? 3 : 1);
+
+        final holdRevision = controller.speedRevision;
+        late Future<void> explicitRate;
+        await tester.runAsync(() async {
+          explicitRate = controller.setSpeed(1);
+
+          expect(controller.speedRevision, greaterThan(holdRevision));
+          await Future<void>.delayed(Duration.zero);
+        });
+        await gesture.up();
+        native.boostGate?.complete();
+        await tester.runAsync(() async {
+          await explicitRate;
+
+          await Future<void>.delayed(Duration.zero);
+        });
+        await tester.pump();
+        expect(controller.value.speed, 1);
+        expect(native.speed, 1);
+        expect(
+          native.named('speed').map((call) => (call.arguments as Map)['speed']),
+          [1, 1],
+        );
+        expect(holdOverlay, findsNothing);
+        await tester.pumpWidget(const SizedBox.shrink());
+        await tester.pump(const Duration(milliseconds: 350));
+        late Future<void> disposal;
+        await tester.runAsync(() async {
+          disposal = controller.dispose();
+          await Future<void>.delayed(Duration.zero);
+        });
+        await tester.pump();
+        await tester.runAsync(() => disposal);
       },
     );
   }
@@ -186,7 +703,7 @@ void main() {
         ..value = const LumioPlayerState(
           initialized: true,
           playing: true,
-          speed: 1.5,
+          speed: 4,
         );
       await tester.pumpWidget(host(controller));
       final gesture = await tester.startGesture(
@@ -197,7 +714,7 @@ void main() {
       await tester.pump();
       await gesture.up();
       await tester.pump();
-      expect(controller.speeds, [2, 3]);
+      expect(controller.speeds, [1, 3]);
       expect(controller.value.speed, 3);
       await close(tester, controller);
     },
@@ -210,7 +727,7 @@ void main() {
         ..value = const LumioPlayerState(
           initialized: true,
           playing: true,
-          speed: 1.5,
+          speed: 4,
         );
       final second = TestController()
         ..value = const LumioPlayerState(
@@ -227,7 +744,8 @@ void main() {
       await tester.pump();
       await gesture.up();
       await tester.pump();
-      expect(first.value.speed, 1.5);
+      expect(first.speeds, [1, 4]);
+      expect(first.value.speed, 4);
       expect(second.value.speed, 3);
       expect(second.speeds, isEmpty);
       await close(tester, first);
@@ -344,17 +862,17 @@ void main() {
     tester,
   ) async {
     final controller = TestController()
-      ..value = const LumioPlayerState(initialized: true, speed: 1.5);
+      ..value = const LumioPlayerState(initialized: true, speed: 3);
     await tester.pumpWidget(host(controller));
     final point = tester.getCenter(find.byKey(surfaceKey));
     final gesture = await tester.startGesture(point);
     await tester.pump(kLongPressTimeout + const Duration(milliseconds: 20));
-    expect(controller.value.speed, 2);
+    expect(controller.value.speed, 1);
     await gesture.moveBy(const Offset(50, 0));
     await gesture.up();
     await tester.pump();
-    expect(controller.speeds, [2, 1.5]);
-    expect(controller.value.speed, 1.5);
+    expect(controller.speeds, [1, 3]);
+    expect(controller.value.speed, 3);
     await close(tester, controller);
   });
 
@@ -362,20 +880,21 @@ void main() {
     tester,
   ) async {
     final controller = DelayedSpeedController()
-      ..value = const LumioPlayerState(initialized: true, speed: .75);
+      ..value = const LumioPlayerState(initialized: true, speed: 4);
     await tester.pumpWidget(host(controller));
     final gesture = await tester.startGesture(
       tester.getCenter(find.byKey(surfaceKey)),
     );
     await tester.pump(kLongPressTimeout + const Duration(milliseconds: 20));
-    expect(controller.speeds, [2]);
+    expect(controller.speeds, [1]);
+    expect(controller.value.speed, 4);
     await gesture.up();
     await tester.pump();
-    expect(controller.speeds, [2]);
+    expect(controller.speeds, [1]);
     controller.boost.complete();
     await tester.pump();
-    expect(controller.speeds, [2, .75]);
-    expect(controller.value.speed, .75);
+    expect(controller.speeds, [1, 4]);
+    expect(controller.value.speed, 4);
     await close(tester, controller);
   });
 
@@ -383,22 +902,26 @@ void main() {
     tester,
   ) async {
     final controller = TestController()
-      ..value = const LumioPlayerState(initialized: true, speed: 1.5);
+      ..value = const LumioPlayerState(initialized: true, speed: 3);
     await tester.pumpWidget(host(controller));
     final gesture = await tester.startGesture(
       tester.getCenter(find.byKey(surfaceKey)),
     );
     await tester.pump(kLongPressTimeout + const Duration(milliseconds: 20));
+    expect(controller.speeds, [1]);
     await gesture.cancel();
     await tester.pump();
-    expect(controller.value.speed, 1.5);
+    expect(controller.speeds, [1, 3]);
+    expect(controller.value.speed, 3);
     final second = await tester.startGesture(
       tester.getCenter(find.byKey(surfaceKey)),
     );
     await tester.pump(kLongPressTimeout + const Duration(milliseconds: 20));
+    expect(controller.speeds, [1, 3, 1]);
     await tester.pumpWidget(const SizedBox.shrink());
     await tester.pump();
-    expect(controller.value.speed, 1.5);
+    expect(controller.speeds, [1, 3, 1, 3]);
+    expect(controller.value.speed, 3);
     await second.cancel();
     await close(tester, controller);
   });
@@ -408,19 +931,19 @@ void main() {
   ) async {
     final controller = TestController()
       ..testSource = LumioSource.asset('first.mp4')
-      ..value = const LumioPlayerState(initialized: true, speed: 1.5);
+      ..value = const LumioPlayerState(initialized: true, speed: 3);
     await tester.pumpWidget(host(controller));
     final gesture = await tester.startGesture(
       tester.getCenter(find.byKey(surfaceKey)),
     );
     await tester.pump(kLongPressTimeout + const Duration(milliseconds: 20));
     controller.testSource = LumioSource.asset('second.mp4');
-    controller.value = controller.value.copyWith(speed: 1);
+    controller.value = controller.value.copyWith(speed: 2);
     await tester.pump();
     await gesture.up();
     await tester.pump();
-    expect(controller.speeds, [2]);
-    expect(controller.value.speed, 1);
+    expect(controller.speeds, [1]);
+    expect(controller.value.speed, 2);
     await close(tester, controller);
   });
 
@@ -428,7 +951,7 @@ void main() {
     tester,
   ) async {
     final controller = TestController()
-      ..value = const LumioPlayerState(initialized: true, speed: 1.5);
+      ..value = const LumioPlayerState(initialized: true, speed: 3);
     await tester.pumpWidget(host(controller));
     final gesture = await tester.startGesture(
       tester.getCenter(find.byKey(surfaceKey)),
@@ -438,7 +961,8 @@ void main() {
       engine: LumioPlaybackEngine.webview,
     );
     await tester.pump();
-    expect(controller.value.speed, 1.5);
+    expect(controller.speeds, [1, 3]);
+    expect(controller.value.speed, 3);
     await gesture.up();
     controller.speeds.clear();
     controller.value = controller.value.copyWith(live: true);
@@ -538,7 +1062,7 @@ void main() {
       controller.value = controller.value.copyWith(
         position: const Duration(seconds: 1),
       );
-      await tester.pump(const Duration(seconds: 1));
+      await tester.pump(const Duration(seconds: 4));
       expect(
         find.byKey(const ValueKey('lumio-compact-progress')),
         findsOneWidget,
@@ -552,7 +1076,7 @@ void main() {
       expect(find.byTooltip('Pause'), findsOneWidget);
       expect(tester.element(find.byType(Texture)), same(element));
       controller.value = controller.value.copyWith(playing: false);
-      await tester.pump(const Duration(seconds: 3));
+      await tester.pump(const Duration(seconds: 6));
       expect(find.byTooltip('Play'), findsOneWidget);
       await close(tester, controller);
     },
@@ -572,13 +1096,13 @@ void main() {
     final gesture = await tester.startGesture(
       tester.getCenter(find.byKey(surfaceKey)),
     );
-    await tester.pump(const Duration(seconds: 3));
+    await tester.pump(const Duration(seconds: 6));
     expect(find.byTooltip('Pause'), findsOneWidget);
     await gesture.up();
     controller.value = controller.value.copyWith(
       error: const LumioPlayerError(code: 'test', message: 'Failure'),
     );
-    await tester.pump(const Duration(seconds: 3));
+    await tester.pump(const Duration(seconds: 6));
     expect(find.byTooltip('Retry'), findsOneWidget);
     expect(find.byKey(const ValueKey('lumio-compact-progress')), findsNothing);
     await close(tester, controller);

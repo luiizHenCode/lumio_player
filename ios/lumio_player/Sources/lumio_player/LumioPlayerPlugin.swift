@@ -70,9 +70,9 @@ public final class LumioPlayerPlugin: NSObject, FlutterPlugin, FlutterStreamHand
           throw LumioFailure("invalid_argument", "config must be a map.")
         }
         let config = try LumioConfiguration(arguments["config"] as? [String: Any] ?? [:])
-        let url = try sourceURL(source)
-        configureAudioSessionIfDefault()
-        player.open(url: url, configuration: config)
+        let prepared = try assetSource(source)
+        try lumioConfigureAudioSession(config.audioPolicy)
+        player.openPlaylist(sources: [prepared], index: 0, configuration: config)
         result(nil)
       case "openPlaylist":
         guard let sources = arguments["sources"] as? [[String: Any]], !sources.isEmpty else {
@@ -84,9 +84,9 @@ public final class LumioPlayerPlugin: NSObject, FlutterPlugin, FlutterStreamHand
         }
         let config = try LumioConfiguration(arguments["config"] as? [String: Any] ?? [:])
         // Validate every source before changing the existing queue.
-        let urls = try sources.map { try sourceURL($0) }
-        configureAudioSessionIfDefault()
-        player.openPlaylist(urls: urls, index: index, configuration: config)
+        let prepared = try sources.map { try assetSource($0) }
+        try lumioConfigureAudioSession(config.audioPolicy)
+        player.openPlaylist(sources: prepared, index: index, configuration: config)
         result(nil)
       case "selectPlaylistItem":
         let index = try lumioPlaylistIndex(arguments, length: player.playlistLength)
@@ -111,8 +111,8 @@ public final class LumioPlayerPlugin: NSObject, FlutterPlugin, FlutterStreamHand
         player.setLooping(value.boolValue)
         result(nil)
       case "dispose":
-        player.dispose()
         players.removeValue(forKey: player.id)
+        player.dispose()
         result(nil)
       case "diagnostics": result(player.diagnostics())
       default: result(FlutterMethodNotImplemented)
@@ -125,6 +125,11 @@ public final class LumioPlayerPlugin: NSObject, FlutterPlugin, FlutterStreamHand
       player.report(failure)
       result(FlutterError(code: failure.code, message: failure.message, details: nil))
     }
+  }
+
+  private func assetSource(_ source: [String: Any]) throws -> LumioAssetSource {
+    let headers = try lumioHTTPHeaders(source)
+    return LumioAssetSource(url: try sourceURL(source), headers: headers)
   }
 
   private func sourceURL(_ source: [String: Any]) throws -> URL {
@@ -142,14 +147,7 @@ public final class LumioPlayerPlugin: NSObject, FlutterPlugin, FlutterStreamHand
     guard format != "dash", format != "rtsp" else {
       throw LumioFailure("unsupported_format", "AVPlayer does not support DASH or RTSP.")
     }
-    if let rawHeaders = source["headers"], !(rawHeaders is NSNull) {
-      guard let headers = rawHeaders as? [String: String] else {
-        throw LumioFailure("invalid_argument", "source.headers must be a string-to-string map.")
-      }
-      guard headers.isEmpty else {
-        throw LumioFailure("unsupported_headers", "Arbitrary HTTP headers are not supported by the public AVURLAsset API. Use signed URLs or server-side authentication.")
-      }
-    }
+
     let url: URL
     switch type {
     case "network":
@@ -189,17 +187,6 @@ public final class LumioPlayerPlugin: NSObject, FlutterPlugin, FlutterStreamHand
     return url
   }
 
-  // Preserve an audio policy already selected by the host or another plugin.
-  // AVPlayer manages activation; we never deactivate a shared session on disposal.
-  private func configureAudioSessionIfDefault() {
-    let session = AVAudioSession.sharedInstance()
-    guard session.category == .soloAmbient else { return }
-    do {
-      try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
-    } catch {
-      NSLog("lumio_player: audio session configuration failed.")
-    }
-  }
 
   public func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
     eventSink = events

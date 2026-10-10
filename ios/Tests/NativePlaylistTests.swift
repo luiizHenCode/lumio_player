@@ -154,11 +154,28 @@ final class NativePlaylistTests: XCTestCase {
     player.selectPlaylistItem(index: 1)
     player.open(url: urls[0], configuration: try LumioConfiguration([:]))
     XCTAssertEqual(player.playlistLength, 1)
+    _ = player.diagnostics() // Start asynchronous metadata loading before disposal.
     player.dispose()
+    player.dispose()
+    XCTAssertEqual(player.playlistLength, 0)
+    XCTAssertNil(player.copyPixelBuffer())
     let count = events
     let drained = expectation(description: "Main queue drains pending KVO callbacks")
     DispatchQueue.main.async { drained.fulfill() }
     wait(for: [drained], timeout: 2)
     XCTAssertEqual(events, count)
+  }
+
+  func testDisposedPlayerIsNotRetainedByObserversOrTimers() throws {
+    let registry = PlaylistTextureRegistry()
+    weak var released: LumioNativePlayer?
+    autoreleasepool {
+      let player = LumioNativePlayer(id: 2, registry: registry) { _ in }
+      released = player
+      player.dispose()
+      player.dispose()
+    }
+    XCTAssertNil(released)
+    XCTAssertEqual(registry.removals, 1)
   }
 }

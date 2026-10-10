@@ -66,9 +66,51 @@ struct ConfigurationTests {
         precondition(failure.code == "invalid_argument")
       }
     }
+    try testAudioAndHeaders()
     try testPlaylistArguments()
     try testLiveSeek()
     print("PASS: defaults, full configuration, \(valid.count) valid boundaries, \(invalid.count) invalid configurations, seek arguments, playlist indices/loop policy, and live-seek targets/rejections")
+  }
+
+  static func testAudioAndHeaders() throws {
+    let defaults = try LumioConfiguration([:])
+    precondition(defaults.audioPolicy == .preserveHost && !defaults.allowBackgroundPlayback)
+    for policy in LumioAudioPolicy.allCases {
+      for background in [false, true] {
+        let config = try LumioConfiguration(["audioPolicy": policy.rawValue, "allowBackgroundPlayback": background])
+        precondition(config.audioPolicy == policy && config.allowBackgroundPlayback == background)
+      }
+    }
+    for map: [String: Any] in [
+      ["audioPolicy": "unknown"], ["audioPolicy": "Exclusive"], ["audioPolicy": true],
+      ["audioPolicy": NSNull()], ["allowBackgroundPlayback": 1],
+      ["allowBackgroundPlayback": "true"], ["allowBackgroundPlayback": NSNull()]
+    ] {
+      do { _ = try LumioConfiguration(map); fatalError("Accepted invalid audio setting") }
+      catch let failure as LumioFailure { precondition(failure.code == "invalid_argument") }
+    }
+    let headers = ["Authorization": "Bearer PRIVATE_HEADER_VALUE", "X-Custom": "valid\tvalue"]
+    let parsed = try lumioHTTPHeaders(["type": "network", "headers": headers])
+    precondition(parsed == headers)
+    let source = LumioAssetSource(url: URL(string: "https://example.test/video.m3u8")!, headers: parsed)
+    precondition(source.assetOptions?["AVURLAssetHTTPHeaderFieldsKey"] as? [String: String] == headers)
+    precondition(LumioAssetSource(url: source.url).assetOptions == nil)
+    for raw: Any in [
+      ["Bad Name": "PRIVATE_HEADER_VALUE"], ["": "value"],
+      ["X-Test": "PRIVATE_HEADER_VALUE\r\nInjected: true"], ["X-Test": "value\0"],
+      ["X-Test": "one", "x-test": "two"], ["X-Test": 1], "PRIVATE_HEADER_VALUE"
+    ] {
+      do { _ = try lumioHTTPHeaders(["type": "network", "headers": raw]); fatalError("Accepted invalid headers") }
+      catch let failure as LumioFailure {
+        precondition(failure.code == "invalid_argument" && !failure.message.contains("PRIVATE_HEADER_VALUE"))
+        precondition(failure.details == nil)
+      }
+    }
+    for type in ["file", "asset"] {
+      do { _ = try lumioHTTPHeaders(["type": type, "headers": headers]); fatalError("Accepted local headers") }
+      catch let failure as LumioFailure { precondition(failure.code == "invalid_argument") }
+    }
+    print("PASS: audio policies/background defaults and validation, safe HTTP headers and AVURLAsset options")
   }
 
   static func testPlaylistArguments() throws {

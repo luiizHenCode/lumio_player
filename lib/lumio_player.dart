@@ -4,5 +4,6 @@ library;
 export 'src/controller.dart';
 export 'src/controls_configuration.dart';
 export 'src/models.dart';
+export 'src/recovery_configuration.dart';
 export 'src/player_view.dart';
 export 'src/statistics_view.dart';
