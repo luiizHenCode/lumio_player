@@ -120,6 +120,44 @@ const allOff = LumioControlsConfiguration(
 );
 
 void main() {
+  testWidgets('video time is aligned with progress at its right edge', (
+    tester,
+  ) async {
+    final controller = TestController()
+      ..value = const LumioPlayerState(
+        initialized: true,
+        position: Duration(seconds: 4),
+        duration: Duration(seconds: 77),
+      );
+    await tester.pumpWidget(host(controller, width: 300, title: 'Video title'));
+    final slider = tester.getRect(find.byKey(const ValueKey('lumio-progress')));
+    final time = tester.getRect(
+      find.byKey(const ValueKey('lumio-progress-time')),
+    );
+    expect(find.text('0:04 / 1:17'), findsOneWidget);
+    expect(time.center.dy, closeTo(slider.center.dy, 0.1));
+    expect(time.left, greaterThanOrEqualTo(slider.right));
+    expect(tester.takeException(), isNull);
+    await close(tester, controller);
+  });
+
+  testWidgets('time remains available when progress is hidden', (tester) async {
+    final controller = TestController()
+      ..value = const LumioPlayerState(
+        initialized: true,
+        duration: Duration(minutes: 1),
+      );
+    await tester.pumpWidget(
+      host(
+        controller,
+        configuration: const LumioControlsConfiguration(showProgress: false),
+      ),
+    );
+    expect(find.byKey(const ValueKey('lumio-progress-row')), findsNothing);
+    expect(find.text('0:00 / 1:00'), findsOneWidget);
+    await close(tester, controller);
+  });
+
   test('configuration defaults and runtime validation', () {
     const defaults = LumioControlsConfiguration();
     defaults.validate();

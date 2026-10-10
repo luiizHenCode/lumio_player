@@ -654,6 +654,8 @@ class _LumioPlayerControlsState extends State<LumioPlayerControls> {
             _config.progressColor ?? Theme.of(context).colorScheme.primary;
         final title =
             widget.title ?? _controller.title ?? _controller.currentItem?.title;
+        final separateTime =
+            _config.showTime && (live || !_config.showProgress);
         Widget button(String tooltip, IconData icon, VoidCallback? action) =>
             IconButton(tooltip: tooltip, icon: Icon(icon), onPressed: action);
         if (widget.compacted) {
@@ -698,78 +700,105 @@ class _LumioPlayerControlsState extends State<LumioPlayerControls> {
                   mainAxisSize: MainAxisSize.min,
                   children: [
                     if (_config.showProgress && !live)
-                      SliderTheme(
-                        data: SliderTheme.of(context).copyWith(
-                          activeTrackColor: accent,
-                          thumbColor: accent,
-                          inactiveTrackColor: _config.foregroundColor
-                              .withValues(alpha: .2),
-                          trackHeight: 3,
-                        ),
-                        child: Slider(
-                          key: const ValueKey('lumio-progress'),
-                          value: progress,
-                          max: duration > 0 ? duration : 1,
-                          label: _time(
-                            Duration(milliseconds: progress.round()),
-                          ),
-                          semanticFormatterCallback: (value) =>
-                              _time(Duration(milliseconds: value.round())),
-                          onChangeStart: seekable
-                              ? (value) {
-                                  _dragSource = _controller.source;
-                                  _dragIndex = _controller.playlistIndex;
-                                  widget.onInteraction?.call(true);
-                                }
-                              : null,
-                          onChanged: seekable
-                              ? (value) {
-                                  // Also support accessibility's discrete slider changes.
-                                  _dragSource ??= _controller.source;
-                                  _dragIndex ??= _controller.playlistIndex;
-                                  setState(() => _drag = value);
-                                }
-                              : null,
-                          onChangeEnd: seekable
-                              ? (value) {
-                                  final sameItem =
-                                      identical(
-                                        _dragSource,
-                                        _controller.source,
-                                      ) &&
-                                      _dragIndex == _controller.playlistIndex;
-                                  setState(() {
-                                    _drag = null;
-                                    _dragSource = null;
-                                    _dragIndex = null;
-                                  });
-                                  if (sameItem && _seekable(_controller)) {
-                                    unawaited(
-                                      _command(
-                                        () => _controller.seekTo(
-                                          Duration(
-                                            milliseconds: value.round().clamp(
-                                              0,
-                                              _controller
-                                                  .value
-                                                  .duration
-                                                  .inMilliseconds,
+                      Row(
+                        key: const ValueKey('lumio-progress-row'),
+                        children: [
+                          Expanded(
+                            flex: 3,
+                            child: SliderTheme(
+                              data: SliderTheme.of(context).copyWith(
+                                activeTrackColor: accent,
+                                thumbColor: accent,
+                                inactiveTrackColor: _config.foregroundColor
+                                    .withValues(alpha: .2),
+                                trackHeight: 3,
+                              ),
+                              child: Slider(
+                                key: const ValueKey('lumio-progress'),
+                                value: progress,
+                                max: duration > 0 ? duration : 1,
+                                label: _time(
+                                  Duration(milliseconds: progress.round()),
+                                ),
+                                semanticFormatterCallback: (value) => _time(
+                                  Duration(milliseconds: value.round()),
+                                ),
+                                onChangeStart: seekable
+                                    ? (value) {
+                                        _dragSource = _controller.source;
+                                        _dragIndex = _controller.playlistIndex;
+                                        widget.onInteraction?.call(true);
+                                      }
+                                    : null,
+                                onChanged: seekable
+                                    ? (value) {
+                                        // Also support accessibility's discrete slider changes.
+                                        _dragSource ??= _controller.source;
+                                        _dragIndex ??=
+                                            _controller.playlistIndex;
+                                        setState(() => _drag = value);
+                                      }
+                                    : null,
+                                onChangeEnd: seekable
+                                    ? (value) {
+                                        final sameItem =
+                                            identical(
+                                              _dragSource,
+                                              _controller.source,
+                                            ) &&
+                                            _dragIndex ==
+                                                _controller.playlistIndex;
+                                        setState(() {
+                                          _drag = null;
+                                          _dragSource = null;
+                                          _dragIndex = null;
+                                        });
+                                        if (sameItem &&
+                                            _seekable(_controller)) {
+                                          unawaited(
+                                            _command(
+                                              () => _controller.seekTo(
+                                                Duration(
+                                                  milliseconds: value
+                                                      .round()
+                                                      .clamp(
+                                                        0,
+                                                        _controller
+                                                            .value
+                                                            .duration
+                                                            .inMilliseconds,
+                                                      ),
+                                                ),
+                                              ),
                                             ),
-                                          ),
-                                        ),
-                                      ),
-                                    );
-                                  } else {
-                                    _menuClosed();
-                                  }
-                                }
-                              : null,
-                        ),
+                                          );
+                                        } else {
+                                          _menuClosed();
+                                        }
+                                      }
+                                    : null,
+                              ),
+                            ),
+                          ),
+                          if (_config.showTime)
+                            Flexible(
+                              flex: 2,
+                              child: Padding(
+                                padding: const EdgeInsets.only(right: 4),
+                                child: Text(
+                                  '${_time(Duration(milliseconds: progress.round()))} / ${_time(state.duration)}',
+                                  key: const ValueKey('lumio-progress-time'),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                            ),
+                        ],
                       ),
                     if ((_config.showTitle &&
                             title != null &&
                             title.isNotEmpty) ||
-                        _config.showTime)
+                        separateTime)
                       Padding(
                         padding: const EdgeInsets.symmetric(
                           horizontal: 4,
@@ -815,7 +844,7 @@ class _LumioPlayerControlsState extends State<LumioPlayerControls> {
                                     Expanded(child: titleWidget)
                                   else
                                     const Spacer(),
-                                  if (_config.showTime) ...[
+                                  if (separateTime) ...[
                                     const SizedBox(width: 12),
                                     timeWidget,
                                   ],
@@ -827,7 +856,7 @@ class _LumioPlayerControlsState extends State<LumioPlayerControls> {
                               mainAxisSize: MainAxisSize.min,
                               children: [
                                 if (hasTitle) titleWidget,
-                                if (_config.showTime) timeWidget,
+                                if (separateTime) timeWidget,
                               ],
                             );
                           },
