@@ -135,6 +135,9 @@ final class NativePlaylistTests: XCTestCase {
       let payload = String(data: try! JSONSerialization.data(withJSONObject: event), encoding: .utf8)!
       XCTAssertFalse(payload.contains(marker))
       XCTAssertEqual(event["recoverable"] as? Bool, false)
+      XCTAssertEqual(event["code"] as? String, "ios_native_terminal_error")
+      let details = event["details"] as? [String: Any]
+      XCTAssertEqual(details?["nativeErrorPhase"] as? String, "open_failed")
       failed.fulfill()
     }
     player.openPlaylist(urls: [url, try audio()], index: 0,

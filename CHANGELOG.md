@@ -2,7 +2,12 @@
 
 ## Próxima versão — estabilidade e experiência de reprodução
 
+- API pública `failureReport()` / `LumioFailureReport`: texto formatado e metadata profundamente imutável, allowlists para detalhes/diagnósticos, timestamp da última falha preservado em recovery/retry/dispose e captura nativa limitada antes do release quando possível.
+- Relatório preserva HTTP status Android extraído de exceção tipada por cadeia cycle-safe, códigos numéricos iOS/Media3 e plataforma/SDK/versão de SO com formato restrito, sem nomes/modelos identificáveis. Testes cobrem falhas iniciais antes do dispose e isolamento da engine capturada.
+
 - Recuperação live de rede opt-in, com watchdog de posição, backoff limitado e cancelamento por intenção/lifecycle.
+- Android identifica HTTP 404 de segmento HLS live por tipo de carga e identidade da exceção; recovery recarrega a fonte e retorna à posição live antes de retomar, sem repetir 404 de manifest/chave, VOD ou autenticação.
+- iOS classifica interrupções live por cadeia NSError/domínio/código e evidência de timeline; recovery limitado retorna ao live antes de retomar. Erros terminais recebem código explícito, sem retry genérico de 404 nem heurística sobre URLs/descrições.
 - Políticas explícitas de áudio nativo (`preserveHost`, `mixWithOthers`, `exclusive`) e opt-in de background, sem serviço ou garantia de reprodução em background.
 - Headers HTTP por fonte/playlist no iOS via options de `AVURLAsset`, com ressalvas de propagação HLS/redirects documentadas.
 - Cleanup independente com deadlines, liberação de criações nativas tardias e logs correlacionados por player.
@@ -10,6 +15,7 @@
 - Estado compacto compartilhável entre views/controllers, preservado em transições; toque para ocultar/exibir também com vídeo pausado e indicador de pausa no compacto.
 - Prévia durante scrubbing opt-in com coalescing, guards de ownership e retomada protegida; Android espera callback de frame com deadline e restaura parâmetros de seek.
 - Android reassocia a superfície após resize do `SurfaceProducer`; removido registro redundante das pastas Kotlin como fontes Java.
+- Loading de abertura, buffering e transição usa o mesmo spinner branco sobre círculo escuro translúcido, independente do tema e da visibilidade dos controles.
 - Teardown reforçado no Android/iOS/WebView, testes de regressão e checklist de validação física em `MOBILE_VALIDATION.md`.
 - Prévia Android confirmada pelo usuário após correção da superfície; isso não substitui matriz completa de dispositivos, testes de rede/áudio ou profiling.
 

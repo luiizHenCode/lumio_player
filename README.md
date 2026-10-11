@@ -295,6 +295,7 @@ A API pública é exportada por `lib/lumio_player.dart`: models, `LumioPlayerCon
 | `setEngine(engine)` | Troca engine; tenta restaurar posição VOD e estado de reprodução |
 | `retry()` | Reabre a fonte; tenta restaurar posição VOD; em live não restaura posição anterior |
 | `diagnostics()` | Snapshot sob demanda, com sanitização de strings |
+| `failureReport()` | `Future<LumioFailureReport?>`: relatório seguro da falha atual/última, inclusive após dispose |
 | `dispose()` | Libera recursos e rejeita novas operações |
 
 Comandos são serializados. Uma falha não envenena a fila dos comandos seguintes. Os comandos despachados à engine **nativa** têm espera limitada por `configuration.initializationTimeout`; timeout produz `LumioPlayerError(code: 'command_timeout', ...)`. A WebView mantém seus próprios limites de operação. Isso limita a espera, não cancela o método já em execução na plataforma.
@@ -615,6 +616,8 @@ final player = LumioPlayerController(
 - `preserveHost` é o default: não altera a sessão compartilhada iOS nem solicita foco Android. Para reprodução independente, selecione explicitamente `mixWithOthers` (iOS `.playback` com mistura; Android sem solicitar foco) ou `exclusive` (iOS `.playback` sem mistura; Android foco gerenciado pelo Media3). A sessão iOS nunca é desativada no dispose. Essas políticas são nativas; WebView segue as regras do browser/host.
 - Por default, o controller pausa em `hidden`/`paused`/`detached` e retoma apenas se a intenção de playback continua ativa. `inactive` não causa pausa automática. `allowBackgroundPlayback: true` opta por não pausar, mas **não** cria serviço Android, capabilities iOS, media session, PiP nem suporte de background WebView.
 - Recovery é **opt-in**, apenas live de rede com playback solicitado e app em foreground. Erros transitórios identificados e falta de avanço da posição disparam até três restarts, com delays padrão de 1, 2 e 4 segundos. Engine, volume, velocidade e intenção são preservados. Autenticação, fonte inválida, codec não suportado e erros desconhecidos sem sinal de transitoriedade não são repetidos automaticamente.
+- Android nativo: um HTTP 404 de segmento HLS pode ser recuperado quando o stream já está inicializado e o Media3 identifica uma transmissão live. A classificação usa o tipo de carga e a identidade da exceção; não depende de extensão da URL ou texto do erro. O código `hls_live_segment_unavailable` recarrega a fonte e executa `seekToLive` antes de retomar, usando o mesmo orçamento/backoff. 404 de manifest/chave, VOD e 401/403 continuam definitivos; não há bypass de cache nem garantia de corrigir segmentos ausentes no servidor. Essa classificação específica não está implementada no AVPlayer/WebView.
+- iOS nativo: `ios_live_network_interruption` permite recovery somente após readiness e evidência live (duração indefinida ou janela finita observada deslizando), com uma cadeia de erros de rede transitórios reconhecidos ou reset de media services. O wrapper AVFoundation `-11800` só é aceito com causa transitória reconhecida. Recovery reabre e executa `seekToLive` antes de play. `ios_native_terminal_error` preserva a fase original em `nativeErrorPhase` e não é reinterpretado pelas heurísticas Dart. Auth, TLS, codec, causas desconhecidas e evidência HTTP 401/403/404 permanecem terminais; AVPlayer não oferece a mesma identificação segura de segmento 404 do Android. Diagnostics incluem apenas domínios conhecidos/códigos numéricos e histórico de status, sem URLs ou descrições nativas.
 - O orçamento só é renovado depois de progresso sustentado, não ao receber `initialized`. Pausa, troca de fonte/engine, retry manual, background e dispose invalidam tentativas pendentes. Falha inicial de `open()` continua rejeitando seu Future; recovery depende de intenção de playback ativa.
 - O watchdog é uma **heurística de posição**, não detecção de frame congelado nem medição de latência. Mantenha `LumioPlayerView` montado durante erro/reabertura, principalmente com WebView. Observe `transitioning`, estado e erros; o erro terminal permanece disponível.
 
@@ -686,6 +689,27 @@ ValueListenableBuilder<LumioPlayerState>(
 O estado imutável contém `initialized`, `playing`, `buffering`, `completed`, `transitioning`, `live`, `position`, `duration`, `bufferedPosition`, `size`, `aspectRatio`, `volume`, `speed`, `engine` e `error`. Os backends emitem eventos em mudanças e atualizações periódicas de cerca de 500 ms; não é uma telemetria frame a frame. Buffer e posição têm semânticas específicas do backend, não uma métrica de download uniforme.
 
 `LumioPlayerError` expõe `code`, `message`, `details`, `recoverable` e `engine` opcional. Um erro pode rejeitar o Future da operação **ou aparecer depois em `value.error`**, durante a reprodução. Observe ambos. `recoverable` sozinho não dispara retry nem garante sucesso; recovery exige opt-in e as condições descritas acima. Falhas dos comandos da engine, inclusive `PlatformException` nativa, são convertidas e lançadas como **`LumioPlayerError` sanitizado**, em vez de repassar a exceção bruta; os logs também ocultam URI/segredos conhecidos. A validação de argumentos e o uso antes de inicialização/depois de descarte continuam podendo produzir `ArgumentError`/`StateError`; trate esses casos além de `LumioPlayerError`.
+
+### Relatório de falha para sheet do host
+
+```dart
+import 'package:lumio_player/lumio_player.dart';
+
+final LumioFailureReport? report = await controller.failureReport();
+if (report != null) {
+  final String textForSheet = report.formattedText;
+  final Map<String, Object?> metadata = report.metadata;
+  // O host apresenta textForSheet no seu sheet; o plugin não abre UI.
+}
+```
+
+A assinatura é `Future<LumioFailureReport?> failureReport()`. Retorna `null` se nenhuma falha foi observada. `LumioFailureReport` expõe `timestamp` (UTC, instante da falha), `code`, `message`, `formattedText` e `metadata` profundamente imutável. A última falha permanece durante recovery/retry, troca de fonte/engine e após `dispose()`; uma nova falha substitui o histórico. O relatório representa o instante da falha, não o estado atual de sucesso/recovery.
+
+Metadata contém `engine`, `requestedEngine`, `platform`, `recoverable`, `fallbackUsed`, `configuration`, `recovery`, `playback`, `details`, `native` e `diagnosticsStatus` (`captured`/`unavailable`). A plataforma vem do Flutter; não inclui identificação do dispositivo. Em `native`, Android preserva `sdkInt` inteiro (1…1000) e `androidVersion`; iOS preserva `device.platform` por allowlist e `device.systemVersion`. Versões de SO aceitam somente string completa de 1 a 4 componentes numéricos de até 3 dígitos, separados por pontos (ou número finito 0…999); nomes/modelos/manufacturer/identificadores ficam excluídos. Detalhes preservam `httpStatus` numérico tipado do Android, `errorCode` Media3 e códigos numéricos da `nativeErrorChain` iOS, mesmo quando o domínio é desconhecido e descartado. A captura nativa é agendada fora do callback, com timeout de 200ms, antes do release quando possível. Pode acrescentar até 200ms ao retry/fallback/release da engine com falha; dispose não espera por ela. Não consulta a engine substituta para enriquecer uma falha antiga. Após descarte retorna o snapshot já disponível, sem novas consultas; detalhes nativos podem estar ausentes.
+
+**Privacidade do relatório:** códigos e strings de diagnóstico passam por allowlists de valores exatos, com a única exceção de versões de SO no formato numérico restrito acima; códigos desconhecidos viram `unknown_error`. A mensagem é controlada pela biblioteca, nunca a descrição arbitrária da exceção. Somente números finitos, booleanos e estruturas/campos permitidos são projetados dos detalhes e diagnósticos. Cadeias/logs são limitados a 30 entradas e a profundidade é limitada. URLs (inclusive desconhecidas), headers, tokens, caminhos, títulos, comentários, descrições nativas, nomes arbitrários de decoder/dispositivo e campos desconhecidos não são copiados. Não há envio, armazenamento persistente ou coleta periódica; a captura ocorre na falha. `value.error`, logs e `diagnostics()` mantêm seu contrato anterior de redaction e **não têm a mesma garantia de allowlist**: para o sheet copiável use somente o relatório, sem concatenar mensagens/detalhes brutos.
+
+Apps com dependência Git fixada em commit antigo não recebem esta API automaticamente. Valide a cópia local com um override temporário de dependência via CLI/ambiente de teste, confirme a resolução em `.dart_tool/package_config.json` e remova o override depois. Não altere permanentemente o `pubspec.yaml` do host nem o commit fixado sem autorização.
 
 ### Observabilidade opt-in e privacidade
 
@@ -820,6 +844,10 @@ xcrun --sdk macosx swiftc -swift-version 5 -warnings-as-errors \
   ios/lumio_player/Sources/lumio_player/LumioLiveSeek.swift \
   ios/Tests/ConfigurationTests.swift -o ios/.native-validation/configuration-tests
 ios/.native-validation/configuration-tests
+xcrun --sdk macosx swiftc -swift-version 5 -warnings-as-errors \
+  ios/lumio_player/Sources/lumio_player/LumioLiveError.swift \
+  ios/Tests/LiveErrorTests.swift -o ios/.native-validation/live-error-tests
+ios/.native-validation/live-error-tests
 ```
 
 Esse comando não compila AVPlayer/FlutterTexture nem valida reprodução iOS. Compile a integração completa pelo host Flutter com SDK iOS/Xcode configurados; não há wrapper de testes Swift Package independente.

@@ -1976,6 +1976,55 @@ void main() {
     await close(tester, controller);
   });
 
+  testWidgets(
+    'initial loading, buffering and reopening share the same loader',
+    (tester) async {
+      final controller = TestController();
+      await tester.pumpWidget(host(controller, controls: false));
+      for (final state in const [
+        LumioPlayerState(buffering: true),
+        LumioPlayerState(initialized: true, playing: true, buffering: true),
+        LumioPlayerState(initialized: true, transitioning: true),
+      ]) {
+        controller.value = state;
+        await tester.pump();
+        final loader = find.byKey(const ValueKey('lumio-loading-indicator'));
+        expect(loader, findsOneWidget);
+        expect(tester.getSize(loader), const Size(48, 48));
+        final spinner = find.descendant(
+          of: loader,
+          matching: find.byType(CircularProgressIndicator),
+        );
+        expect(tester.getSize(spinner), const Size(24, 24));
+        final indicator = tester.widget<CircularProgressIndicator>(spinner);
+        expect(indicator.color, Colors.white);
+        expect(indicator.strokeWidth, 2.6);
+        final background =
+            tester
+                    .widget<DecoratedBox>(
+                      find.descendant(
+                        of: loader,
+                        matching: find.byType(DecoratedBox),
+                      ),
+                    )
+                    .decoration
+                as BoxDecoration;
+        expect(background.shape, BoxShape.circle);
+        expect(background.color, const Color(0x61000000));
+      }
+      controller.value = const LumioPlayerState(
+        initialized: true,
+        playing: true,
+      );
+      await tester.pump();
+      expect(
+        find.byKey(const ValueKey('lumio-loading-indicator')),
+        findsNothing,
+      );
+      await close(tester, controller);
+    },
+  );
+
   testWidgets('individual switches remove only their own UI', (tester) async {
     final controller = TestController()
       ..value = const LumioPlayerState(

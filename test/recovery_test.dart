@@ -204,6 +204,185 @@ void main() {
     });
   }
 
+  test(
+    'classified live segment 404 reloads and seeks live before play',
+    () async {
+      await player.open(source);
+      await player.setVolume(.4);
+      await player.setSpeed(1.5);
+      await error('hls_live_segment_unavailable', details: {'httpStatus': 404});
+      await flush(35);
+      expect(native.named('open'), hasLength(2));
+      expect(native.named('seekToLive'), hasLength(1));
+      expect(native.named('play'), hasLength(1));
+      expect(
+        native.calls.indexOf(native.named('seekToLive').single),
+        lessThan(native.calls.indexOf(native.named('play').single)),
+      );
+      final config =
+          (native.named('open').last.arguments as Map)['config'] as Map;
+      expect(config['volume'], .4);
+      expect(config['speed'], 1.5);
+      expect(config['autoPlay'], isFalse);
+      expect(player.value.engine, LumioPlaybackEngine.native);
+    },
+  );
+
+  test('failed live seek never resumes playback during recovery', () async {
+    await player.open(source);
+    native.intercept = (call) async {
+      if (call.method == 'seekToLive') {
+        throw PlatformException(code: 'unsupported_live_seek');
+      }
+      return native.respond(call);
+    };
+    await error('hls_live_segment_unavailable', details: {'httpStatus': 404});
+    await flush(160);
+    expect(native.named('open'), hasLength(2));
+    expect(native.named('play'), isEmpty);
+    expect(player.value.error?.code, 'unsupported_live_seek');
+  });
+
+  test('generic 404 in HTTP details remains terminal', () async {
+    await player.open(source);
+    await error('ERROR_CODE_IO_BAD_HTTP_STATUS', details: {'httpStatus': 404});
+    await flush(160);
+    expect(native.named('open'), hasLength(1));
+    expect(native.named('seekToLive'), isEmpty);
+  });
+
+  test('classified segment error cannot recover VOD', () async {
+    await player.dispose();
+    create(mode: LumioPlaybackMode.video);
+    await player.open(
+      LumioSource.network(Uri.parse('https://example.com/video.mp4')),
+    );
+    await state({'live': false});
+    await error('hls_live_segment_unavailable', details: {'httpStatus': 404});
+    await flush(160);
+    expect(native.named('open'), hasLength(1));
+    expect(native.named('seekToLive'), isEmpty);
+  });
+
+  test('classified segment recovery respects retry budget', () async {
+    await player.open(source);
+    await error('hls_live_segment_unavailable', details: {'httpStatus': 404});
+    await flush(35);
+    await error('hls_live_segment_unavailable', details: {'httpStatus': 404});
+    await flush(55);
+    await error('hls_live_segment_unavailable', details: {'httpStatus': 404});
+    await flush(60);
+    expect(native.named('open'), hasLength(3));
+    expect(native.named('seekToLive'), hasLength(2));
+    expect(player.value.error?.code, 'hls_live_segment_unavailable');
+  });
+
+  test('pause cancels missing live segment recovery', () async {
+    await player.open(source);
+    await error('hls_live_segment_unavailable', details: {'httpStatus': 404});
+    await player.pause();
+    await flush(160);
+    expect(native.named('open'), hasLength(1));
+    expect(native.named('seekToLive'), isEmpty);
+  });
+
+  test(
+    'classified segment without native recoverable flag is terminal',
+    () async {
+      await player.open(source);
+      await error('hls_live_segment_unavailable', recoverable: false);
+      await flush(160);
+      expect(native.named('open'), hasLength(1));
+    },
+  );
+
+  test(
+    'classified iOS live interruption reloads and seeks live before play',
+    () async {
+      await player.open(source);
+      await state({'initialized': false, 'buffering': true});
+      await error(
+        'ios_live_network_interruption',
+        details: {
+          'nativeErrorChain': [
+            {'domain': 'AVFoundationErrorDomain', 'code': -11800},
+            {'domain': 'NSURLErrorDomain', 'code': -1005},
+          ],
+          'errorLogStatusCodes': [404],
+          'currentErrorLogStatusCodes': [],
+        },
+      );
+      await flush(35);
+      expect(native.named('open'), hasLength(2));
+      expect(native.named('seekToLive'), hasLength(1));
+      expect(native.named('play'), hasLength(1));
+      expect(
+        native.calls.indexOf(native.named('seekToLive').single),
+        lessThan(native.calls.indexOf(native.named('play').single)),
+      );
+    },
+  );
+
+  test(
+    'iOS terminal classification cannot be overridden by nested timeout',
+    () async {
+      await player.open(source);
+      await error(
+        'ios_native_terminal_error',
+        recoverable: false,
+        details: {
+          'nativeCode': -11800,
+          'nativeErrorChain': [
+            {'domain': 'unknown', 'code': -1001},
+          ],
+        },
+      );
+      await flush(160);
+      expect(native.named('open'), hasLength(1));
+      expect(native.named('seekToLive'), isEmpty);
+    },
+  );
+
+  test('classified iOS interruption cannot recover VOD', () async {
+    await player.dispose();
+    create(mode: LumioPlaybackMode.video);
+    await player.open(source);
+    await state({'live': false});
+    await error('ios_live_network_interruption');
+    await flush(160);
+    expect(native.named('open'), hasLength(1));
+  });
+
+  test('iOS interruption respects budget and pause cancellation', () async {
+    await player.open(source);
+    await error('ios_live_network_interruption');
+    await flush(35);
+    await error('ios_live_network_interruption');
+    await flush(55);
+    await error('ios_live_network_interruption');
+    await flush(60);
+    expect(native.named('open'), hasLength(3));
+    expect(native.named('seekToLive'), hasLength(2));
+    expect(player.value.error?.code, 'ios_live_network_interruption');
+    await player.retry();
+    await error('ios_live_network_interruption');
+    await player.pause();
+    await flush(160);
+    expect(native.named('open'), hasLength(4));
+  });
+
+  test(
+    'classified iOS interruption respects disabled recovery policy',
+    () async {
+      await player.dispose();
+      create(policy: const LumioRecoveryConfiguration());
+      await player.open(source);
+      await error('ios_live_network_interruption');
+      await flush(160);
+      expect(native.named('open'), hasLength(1));
+    },
+  );
+
   test('iOS native timeout is recognized with recoverable false', () async {
     await player.open(source);
     await error(

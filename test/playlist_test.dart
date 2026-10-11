@@ -227,6 +227,8 @@ void main() {
       });
       await flushNativeEvents();
       expect(controller.value.error?.code, 'old_item_error');
+      final failure = (await controller.failureReport())!;
+      expect((failure.metadata['playback'] as Map)['playlistIndex'], 0);
       native.index = 1;
       await native.state(
         extra: {
@@ -251,7 +253,12 @@ void main() {
       expect(controller.value.playing, isTrue);
       expect(controller.value.error, isNull);
       expect(controller.textureId, texture);
-      expect(native.calls.length, callCount);
+      expect(
+        native.calls.where((call) => call.method != 'diagnostics').length,
+        callCount,
+      );
+      expect(native.named('diagnostics'), hasLength(1));
+      expect((await controller.failureReport())!.timestamp, failure.timestamp);
     },
   );
 

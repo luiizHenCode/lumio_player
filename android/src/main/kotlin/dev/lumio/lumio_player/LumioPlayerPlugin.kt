@@ -25,12 +25,15 @@ import androidx.media3.exoplayer.SeekParameters
 import androidx.media3.exoplayer.analytics.AnalyticsListener
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.source.MediaSource
+import androidx.media3.exoplayer.source.LoadEventInfo
+import androidx.media3.exoplayer.source.MediaLoadData
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.view.TextureRegistry
 import java.io.File
+import java.io.IOException
 
 @UnstableApi
 class LumioPlayerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
@@ -221,6 +224,7 @@ class LumioPlayerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         private var released = false
         private var hasSource = false
         private var initialized = false
+        private val hlsLiveSegmentFailure = HlsLiveSegmentFailure()
         private var requestedLive = false
         private var surfaceAvailable = true
         private var sourceType: String? = null
@@ -334,6 +338,7 @@ class LumioPlayerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             val replacement = buildPlayer(config)
             try {
                 previewSeek.sourceChanged()
+                hlsLiveSegmentFailure.clear()
                 cleanupAll(
                     { player.removeListener(this) },
                     { player.removeAnalyticsListener(this) },
@@ -380,6 +385,7 @@ class LumioPlayerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
         private fun resetCurrentItem(index: Int) {
             previewSeek.sourceChanged()
+            hlsLiveSegmentFailure.clear()
             initialized = false
             lastError = null
             sourceType = sources.getOrNull(index)?.type
@@ -448,15 +454,47 @@ class LumioPlayerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             emitState()
         }
 
+        override fun onLoadError(
+            eventTime: AnalyticsListener.EventTime,
+            loadEventInfo: LoadEventInfo,
+            mediaLoadData: MediaLoadData,
+            error: IOException,
+            wasCanceled: Boolean,
+        ) {
+            if (!released) hlsLiveSegmentFailure.onLoadError(eventTime, loadEventInfo, mediaLoadData, error, wasCanceled)
+        }
+
+        override fun onLoadCompleted(
+            eventTime: AnalyticsListener.EventTime,
+            loadEventInfo: LoadEventInfo,
+            mediaLoadData: MediaLoadData,
+        ) {
+            hlsLiveSegmentFailure.onLoadCompleted(eventTime, loadEventInfo, mediaLoadData)
+        }
+
+        override fun onLoadCanceled(
+            eventTime: AnalyticsListener.EventTime,
+            loadEventInfo: LoadEventInfo,
+            mediaLoadData: MediaLoadData,
+        ) {
+            hlsLiveSegmentFailure.onLoadCanceled(eventTime, loadEventInfo, mediaLoadData)
+        }
+
         override fun onPlayerError(eventTime: AnalyticsListener.EventTime, error: PlaybackException) {
-            val recoverable = error.errorCode in setOf(
+            if (released) return
+            val segmentUnavailable = hlsLiveSegmentFailure.consume(
+                error, player.currentManifest, player.isCurrentMediaItemLive, initialized,
+            )
+            val recoverable = segmentUnavailable || error.errorCode in setOf(
                 PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED,
                 PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT,
                 PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS,
                 PlaybackException.ERROR_CODE_BEHIND_LIVE_WINDOW,
             )
-            emitError(error.errorCodeName, error.message ?: "Playback failed", mapOf(
+            val code = if (segmentUnavailable) "hls_live_segment_unavailable" else error.errorCodeName
+            emitError(code, error.message ?: "Playback failed", mapOf(
                 "errorCode" to error.errorCode,
+                "httpStatus" to hlsLiveSegmentFailure.httpStatus(error),
                 "cause" to error.cause?.javaClass?.name,
                 "causeMessage" to error.cause?.message,
                 "playlistIndex" to eventTime.windowIndex,
@@ -539,6 +577,7 @@ class LumioPlayerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         fun dispose() {
             if (released) return
             released = true
+            hlsLiveSegmentFailure.clear()
             sources = emptyList()
             lastError = null
             cleanupAll(

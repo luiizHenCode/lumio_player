@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
 import 'models.dart';
+import 'failure_report.dart';
 import 'native_bridge.dart';
 import 'recovery_configuration.dart';
 import 'web_engine.dart';
@@ -48,6 +49,129 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState>
   /// Default headers for network sources. Per-source/open headers take precedence.
   final Map<String, String> httpHeaders;
   final _bridge = LumioNativeBridge();
+  LumioFailureReport? _lastFailure;
+  LumioPlayerError? _recordedFailure;
+  Future<void>? _failureDiagnostics;
+
+  @override
+  set value(LumioPlayerState state) {
+    final error = state.error;
+    if (!_disposed && error != null && !identical(error, _recordedFailure)) {
+      _recordFailure(error, state: state);
+    }
+    if (error == null) _recordedFailure = null;
+    super.value = state;
+  }
+
+  /// Returns the current/last failure, or null if no failure was observed.
+  /// Safe after disposal; never queries a replacement engine for an old failure.
+  Future<LumioFailureReport?> failureReport() async {
+    if (!_disposed) {
+      Future<void>? pending;
+      do {
+        pending = _failureDiagnostics;
+        await pending;
+      } while (!_disposed && !identical(pending, _failureDiagnostics));
+    }
+    return _lastFailure;
+  }
+
+  void _recordFailure(
+    LumioPlayerError error, {
+    LumioPlayerState? state,
+    Object? details,
+  }) {
+    if (_disposed || identical(error, _recordedFailure)) return;
+    _recordedFailure = error;
+    final playback = state ?? value;
+    final report = LumioFailureReport(
+      timestamp: DateTime.now().toUtc(),
+      code: safeFailureCode(error.code),
+      message: 'Playback failed. See the failure code and safe diagnostics.',
+      metadata: {
+        'engine': (error.engine ?? playback.engine).name,
+        'requestedEngine': _requestedEngine.name,
+        'platform': kIsWeb ? 'web' : defaultTargetPlatform.name,
+        'recoverable': error.recoverable,
+        'fallbackUsed': _fallbackUsed,
+        'configuration': {
+          'mode': configuration.mode.name,
+          ...configuration.toMap(),
+          'allowAutomaticFallback': configuration.allowAutomaticFallback,
+        },
+        'recovery': {
+          'enabled': recovery.enabled,
+          'attempts': _attempts,
+          'maxAttempts': recovery.maxAttempts,
+          'initialDelayMs': recovery.initialDelay.inMilliseconds,
+          'maxDelayMs': recovery.maxDelay.inMilliseconds,
+          'stallTimeoutMs': recovery.stallTimeout.inMilliseconds,
+          'stablePlaybackDurationMs':
+              recovery.stablePlaybackDuration.inMilliseconds,
+          'wantsPlayback': _wantsPlayback,
+          'foreground': _foreground,
+        },
+        'playback': {
+          ...safeFailureDiagnostics({
+            'initialized': playback.initialized,
+            'playing': playback.playing,
+            'buffering': playback.buffering,
+            'completed': playback.completed,
+            'live': playback.live,
+            'positionMs': playback.position.inMilliseconds,
+            'durationMs': playback.duration.inMilliseconds,
+            'bufferedPositionMs': playback.bufferedPosition.inMilliseconds,
+            'width': playback.size.width,
+            'height': playback.size.height,
+            'speed': playback.speed,
+            'volume': playback.volume,
+            'playlistIndex': playback.playlistIndex,
+            'playlistLength': playback.playlistLength,
+          }),
+          'sourceType': _source?.type.name,
+          'formatHint': _source?.format.name,
+          'fit': _videoFit.name,
+        },
+        'details': safeFailureDiagnostics(details ?? error.details),
+        'native': <String, Object?>{},
+        'diagnosticsStatus': 'unavailable',
+      },
+    );
+    _lastFailure = report;
+    final id = _id;
+    final web = _web;
+    final generation = _generation;
+    // Defer the channel round trip out of the native event callback. Release
+    // waits only for this bounded snapshot, never for unbounded native work.
+    _failureDiagnostics = Future<void>(() async {
+      if (_disposed ||
+          generation != _generation ||
+          (id == null && web == null)) {
+        return;
+      }
+      try {
+        final raw = web != null
+            ? web.diagnostics
+            : await _bridge
+                  .invoke('diagnostics', id!)
+                  .timeout(const Duration(milliseconds: 200));
+        if (_disposed || !identical(_lastFailure, report)) return;
+        _lastFailure = LumioFailureReport(
+          timestamp: report.timestamp,
+          code: report.code,
+          message: report.message,
+          metadata: {
+            ...report.metadata,
+            'native': safeFailureDiagnostics(raw),
+            'diagnosticsStatus': 'captured',
+          },
+        );
+      } catch (_) {
+        // Diagnostic errors must not replace the playback failure or leak text.
+      }
+    });
+  }
+
   LumioSource? _source;
   LumioPlaylist? _playlist;
   int _playlistIndex = 0;
@@ -172,6 +296,22 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState>
       !value.completed;
 
   bool _temporaryError(LumioPlayerError error) {
+    if (error.code == 'ios_native_terminal_error') return false;
+    if (error.code == 'ios_live_network_interruption') {
+      // AVPlayer classifies the typed error chain and current item's live
+      // evidence. Historical diagnostic entries must not override that result.
+      return error.recoverable &&
+          value.engine == LumioPlaybackEngine.native &&
+          value.live;
+    }
+    if (error.code == 'hls_live_segment_unavailable') {
+      // Only the native HLS loader can distinguish a missing media chunk from
+      // a missing manifest/key. Never infer this exception from a generic 404.
+      return error.recoverable &&
+          value.engine == LumioPlaybackEngine.native &&
+          value.initialized &&
+          value.live;
+    }
     final text = '${error.code} ${error.message} ${error.details}'
         .toLowerCase();
     // Media3 names, HTTP statuses, AVFoundation and NSURLError codes.
@@ -229,7 +369,14 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState>
             'Live network restart $_attempts/${recovery.maxAttempts}.',
             engine: engine,
           );
-          await _start(engine, autoPlay: _wantsPlayback, recovering: true);
+          await _start(
+            engine,
+            autoPlay: _wantsPlayback,
+            recovering: true,
+            recoverToLive:
+                error.code == 'hls_live_segment_unavailable' ||
+                error.code == 'ios_live_network_interruption',
+          );
         }).catchError((Object _) {}),
       );
     });
@@ -562,6 +709,7 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState>
     required bool autoPlay,
     Duration position = Duration.zero,
     bool recovering = false,
+    bool recoverToLive = false,
   }) async {
     _watchdog?.cancel();
     _watchdog = null;
@@ -714,6 +862,9 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState>
       if (position > Duration.zero && !value.live) {
         await _command('seek', {'positionMs': position.inMilliseconds});
       }
+      if (recovering && recoverToLive && value.live && _effectivePlayback) {
+        await _command('seekToLive');
+      }
       final resumeRecovery = recovering && autoPlay && _effectivePlayback;
       if (resumeRecovery) await _command('play');
       if (!_effectivePlayback &&
@@ -726,6 +877,10 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState>
     } catch (error) {
       if (_disposed) rethrow;
       final failure = _asError(error, engine);
+      _recordFailure(
+        failure,
+        details: error is PlatformException ? error.details : null,
+      );
       if (!recovering && _canFallback(failure)) {
         _fallbackUsed = true;
         _log(
@@ -809,6 +964,7 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState>
         recoverable: event['recoverable'] == true,
         engine: value.engine,
       );
+      _recordFailure(error, details: event['details']);
       if (_ready != null && !_ready!.isCompleted) {
         _ready!.completeError(error);
       } else if (!value.transitioning && _canFallback(error)) {
@@ -1065,6 +1221,10 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState>
               engine: value.engine,
             )
           : _asError(error, value.engine);
+      _recordFailure(
+        failure,
+        details: error is PlatformException ? error.details : null,
+      );
       _log(
         LumioLogLevel.error,
         failure.code,
@@ -1236,6 +1396,7 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState>
   }
 
   Future<void> _release() async {
+    if (!_disposed) await _failureDiagnostics;
     ++_generation;
     final subscription = _subscription;
     final web = _web;

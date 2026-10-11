@@ -111,6 +111,12 @@ Playback errors contain `id`, `type: error`, `code`, `message`, `details`, and
 captured from Media3's analytics event window, rather than inferred later from
 the current item, and are also included in `details.playlistIndex`. This lets the
 parent retain errors per item even after selection clears the current error.
+Playback error `details.httpStatus` is the numeric response code of the first
+`HttpDataSource.InvalidResponseCodeException` in the identity/cycle-safe cause
+chain, or null when absent. It is diagnostic evidence only: extracting it does
+not consume pending HLS load evidence or change native classification. Textual
+`causeMessage` is not used to infer this field; the public Dart failure report
+omits arbitrary cause text while retaining this status and Media3 `errorCode`.
 Event subscriptions replay only the current/latest retained error. Diagnostics
 expose only error identity/code/recoverability/indexes, not exception text that
 could contain URLs or headers. A recoverable classification indicates retry may succeed; there

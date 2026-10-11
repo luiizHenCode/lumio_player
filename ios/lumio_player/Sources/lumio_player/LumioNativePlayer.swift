@@ -50,6 +50,8 @@ final class LumioNativePlayer: NSObject, FlutterTexture {
   private var lastFailure: [String: Any]?
   private var accessLog: [[String: Any]] = []
   private var errorLog: [[String: Any]] = []
+  private var liveErrorHistory = LumioLiveErrorHistory()
+  private var liveTimeline = LumioLiveTimeline()
 
   init(id: Int64, registry: FlutterTextureRegistry, emit: @escaping ([String: Any]) -> Void) {
     self.id = id
@@ -156,8 +158,17 @@ final class LumioNativePlayer: NSObject, FlutterTexture {
         action(self)
       }
     }
-    observations.append(item.observe(\.status, options: [.initial, .new]) { _, _ in
+    observations.append(item.observe(\.status, options: [.initial, .new]) { observed, change in
+      // Capture readiness before the main-thread handoff; status may already be failed there.
+      let wasReady = change.newValue == .readyToPlay
+      let duration = observed.duration
+      let ranges = observed.seekableTimeRanges.map { $0.timeRangeValue }
+      let logCount = observed.errorLog()?.events.count ?? 0
       changed { owner in
+        if wasReady {
+          let live = owner.liveTimeline.observe(duration: duration, ranges: ranges)
+          owner.liveErrorHistory.observeReady(live: live, logCount: logCount)
+        }
         if owner.item?.status == .failed {
           owner.wantsPlayback = false
           owner.player.pause()
@@ -402,6 +413,16 @@ final class LumioNativePlayer: NSObject, FlutterTexture {
     }
     let size = item?.presentationSize ?? .zero
     let initialized = item?.status == .readyToPlay
+    if initialized, let current = item {
+      let live = liveTimeline.observe(duration: current.duration,
+                                      ranges: current.seekableTimeRanges.map { $0.timeRangeValue })
+      // Only readiness / active playback retires historical log entries.
+      // Buffering and failed callbacks must retain newly logged HTTP evidence.
+      let healthy = !liveErrorHistory.wasReady ||
+        (player.timeControlStatus == .playing && !current.isPlaybackBufferEmpty)
+      liveErrorHistory.observeReady(live: live,
+        logCount: healthy ? (current.errorLog()?.events.count ?? 0) : nil)
+    }
     let buffering = item != nil && item?.status != .failed && !completed &&
       (!initialized || seeking || (wantsPlayback && (player.timeControlStatus == .waitingToPlayAtSpecifiedRate || item?.isPlaybackBufferEmpty == true)))
     emit([
@@ -438,12 +459,24 @@ final class LumioNativePlayer: NSObject, FlutterTexture {
   }
 
   private func reportNativeError(_ error: Error?, code: String) {
-    let native = error as NSError?
-    // Native descriptions/userInfo can contain signed URLs or credentials.
-    report(LumioFailure(code, "AVFoundation could not play the current item.", details: [
-      "nativeCode": native?.code ?? 0
-    ]), recoverable: false)
     captureLogs()
+    let native = error as NSError?
+    let statuses = (item?.errorLog()?.events ?? []).map { $0.errorStatusCode }
+    let currentStatuses = liveErrorHistory.currentStatusCodes(statuses)
+    let classification = lumioClassifyNativeError(native, currentLogStatusCodes: currentStatuses)
+    let disposition = classification.disposition(phase: code, liveConfigured: configuration.live,
+      wasReady: liveErrorHistory.wasReady, liveDetected: liveErrorHistory.liveDetected)
+    // Explicit codes keep Dart from reclassifying terminal errors or historical logs.
+    // Only safe domain identifiers, the fixed phase and numbers cross the boundary.
+    report(LumioFailure(disposition.code,
+      "AVFoundation could not play the current item.", details: [
+        "nativeErrorPhase": disposition.nativeErrorPhase,
+        "nativeCode": native?.code ?? 0,
+        "nativeErrorChain": classification.chain,
+        "nativeErrorChainComplete": classification.chainComplete,
+        "errorLogStatusCodes": Array(statuses.suffix(30)),
+        "currentErrorLogStatusCodes": Array(currentStatuses.suffix(30))
+      ]), recoverable: disposition.recoverable)
   }
 
   private func captureLogs() {
@@ -539,6 +572,8 @@ final class LumioNativePlayer: NSObject, FlutterTexture {
   }
 
   private func clearItem() {
+    liveErrorHistory.reset()
+    liveTimeline = LumioLiveTimeline()
     statisticsTask?.cancel()
     statisticsTask = nil
     statisticsItem = nil

@@ -782,8 +782,25 @@ class _LumioPlayerViewState extends State<LumioPlayerView> {
                           (state.buffering || state.transitioning))
                         const IgnorePointer(
                           child: Center(
-                            child: CircularProgressIndicator(
-                              semanticsLabel: 'Loading media',
+                            child: SizedBox.square(
+                              key: ValueKey('lumio-loading-indicator'),
+                              dimension: 48,
+                              child: DecoratedBox(
+                                decoration: BoxDecoration(
+                                  color: Color(0x61000000),
+                                  shape: BoxShape.circle,
+                                ),
+                                child: Center(
+                                  child: SizedBox.square(
+                                    dimension: 24,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2.6,
+                                      color: Colors.white,
+                                      semanticsLabel: 'Loading media',
+                                    ),
+                                  ),
+                                ),
+                              ),
                             ),
                           ),
                         ),

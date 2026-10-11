@@ -16,7 +16,13 @@ Esta checklist registra cenários de aceitação, não resultados já aprovados.
 - [ ] Falhar as três tentativas: erro terminal deve continuar visível, com ação manual de retry.
 - [ ] Recuperar apenas por instantes e falhar novamente: `initialized` sozinho não deve renovar orçamento.
 - [ ] Recuperar por mais de 30 s de progresso sustentado: nova falha ganha novo orçamento.
-- [ ] Simular 401/403/404: não repetir autenticação automaticamente nem perder o erro.
+- [ ] Simular 401/403 e 404 de manifest/chave: não repetir autenticação ou fonte inexistente automaticamente nem perder o erro.
+- [ ] Android HLS live: após iniciar playback, responder 404 para um segmento e manter uma janela nova válida; verificar `hls_live_segment_unavailable`, reabertura e retorno à posição live antes de play.
+- [ ] Manter segmentos HLS live indisponíveis: respeitar o orçamento e preservar erro terminal; pausar/sair durante a recuperação cancela a retomada.
+- [ ] VOD HLS com segmento 404: não aplicar a recuperação específica de segmento live.
+- [ ] iOS: interromper uma live já inicializada; quando a cadeia NSError permitir, observar `ios_live_network_interruption`, reabertura e retorno ao live antes de play.
+- [ ] iOS: 404, auth/TLS/codec ou causa desconhecida devem produzir `ios_native_terminal_error`, preservando `nativeErrorPhase` e sem reinícios automáticos.
+- [ ] iOS: substituir fonte/item e verificar que readiness, evidência de janela live e erros antigos não autorizam recuperação da nova fonte.
 - [ ] Pausar/ocultar/sair durante delay e durante reabertura: não retomar áudio/vídeo após abandono.
 - [ ] WebView: manter superfície montada ao mostrar erro; recuperação deve carregar a nova fonte.
 - [ ] VOD: não aplicar watchdog live nem perder posição por recovery automático.

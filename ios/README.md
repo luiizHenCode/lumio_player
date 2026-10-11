@@ -90,6 +90,28 @@ failures stop the current item; they do not silently skip it. Per-item KVO,
 notifications, output, seeks, frame buffers and diagnostics are reset on every
 native transition. Generation and current-item identity guard stale callbacks.
 
+### Live network recovery
+
+Native failures use `ios_live_network_interruption` only for configured live media
+that reached readiness and has live evidence (indefinite duration or an observed
+sliding window). Recognized transient URL errors or a media-services reset are
+eligible; an AVFoundation `-11800` wrapper requires a recognized transient cause.
+The Dart controller still requires opt-in recovery, foreground/play intent and
+an available retry budget. It reopens and seeks live before resuming playback.
+
+Other failures use `ios_native_terminal_error`; `details.nativeErrorPhase` retains
+`open_failed` or `playback_failed`. Authentication, TLS, codecs, unknown causes
+and evidenced HTTP 401/403/404 are terminal. There is no generic segment-404
+recovery: AVPlayer error logs cannot safely distinguish media, manifest and key
+requests. Numeric error history is diagnostic; entries retired during healthy
+playback do not veto later transient errors. This watermark is not guaranteed
+request-level correlation.
+
+Error details contain only allowlisted domain identifiers, numeric codes and the
+original phase, never native descriptions, URLs or raw userInfo. Historical and
+current error-log status lists are bounded. Test the actual network behavior on
+physical iOS devices; parser tests do not prove recovery against a camera.
+
 ### Buffering limitations
 
 AVPlayer owns startup and rebuffering policy; `automaticallyWaitsToMinimizeStalling`

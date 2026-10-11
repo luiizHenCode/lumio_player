@@ -1,5 +1,34 @@
 import CoreMedia
 
+// Recovery requires media evidence, independently of the configuration hint.
+// A finite range strictly inside the VOD timeline is not a live window candidate.
+private func lumioHasLiveWindowCandidate(duration: CMTime, ranges: [CMTimeRange]) -> Bool {
+  if duration.isIndefinite { return true }
+  guard duration.isNumeric, CMTimeCompare(duration, .zero) > 0,
+        let range = ranges.last, range.isValid, !range.isEmpty,
+        range.start.isNumeric, range.duration.isNumeric,
+        CMTimeCompare(range.start, .zero) > 0 else { return false }
+  let end = CMTimeRangeGetEnd(range)
+  return end.isNumeric && CMTimeCompare(end, duration) >= 0
+}
+
+struct LumioLiveTimeline {
+  private var previousWindow: CMTimeRange?
+
+  mutating func observe(duration: CMTime, ranges: [CMTimeRange]) -> Bool {
+    if duration.isIndefinite { return true }
+    guard lumioHasLiveWindowCandidate(duration: duration, ranges: ranges),
+          let window = ranges.last else { return false }
+    let previous = previousWindow
+    previousWindow = window
+    // A single finite suffix of VOD is ambiguous. Require a moving window,
+    // not merely a positive start or the host's live hint.
+    guard let previous = previous else { return false }
+    return CMTimeCompare(window.start, previous.start) > 0 &&
+      CMTimeCompare(CMTimeRangeGetEnd(window), CMTimeRangeGetEnd(previous)) > 0
+  }
+}
+
 // AVPlayer has no universal live flag. An explicit hint permits finite-duration
 // sliding windows, but must not turn an ordinary full-timeline VOD into live.
 func lumioLiveSeekTarget(duration: CMTime, ranges: [CMTimeRange], liveHint: Bool) throws -> CMTime {
