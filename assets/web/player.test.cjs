@@ -98,6 +98,88 @@ test('ready handshake, metadata acknowledgment and audio-only state protocol', a
   assert.equal(h.media().paused, true);
 });
 
+test('video-only playback does not wait for audio and stalled fetching does not imply buffering', async () => {
+  const h = harness({nativeHls: true});
+  await h.receive('open', {...source, live: true, volume: 0});
+  const media = h.media();
+  // No audio track information is provided by this video-only source.
+  media.videoWidth = 1920;
+  media.videoHeight = 1080;
+  media.readyState = 3;
+  media.emit('loadedmetadata');
+  assert.equal(h.events.find(e => e.type === 'ack').ok, true);
+  await h.receive('play');
+  media.emit('playing');
+  media.emit('stalled');
+  let state = h.events.filter(e => e.type === 'state').at(-1);
+  assert.equal(state.initialized, true);
+  assert.equal(state.buffering, false);
+  assert.equal(state.playing, true);
+
+  media.readyState = 2;
+  media.emit('waiting');
+  state = h.events.filter(e => e.type === 'state').at(-1);
+  assert.equal(state.buffering, true);
+  // Resume without another canplay/playing event: real progress clears the flag.
+  media.readyState = 3;
+  media.currentTime = 1;
+  media.emit('timeupdate');
+  state = h.events.filter(e => e.type === 'state').at(-1);
+  assert.equal(state.buffering, false);
+  assert.equal(state.playing, true);
+});
+
+test('buffering remains visible without sufficient data or actual playback progress', async () => {
+  const h = harness({nativeHls: true});
+  await h.receive('open', source);
+  const media = h.media();
+  media.emit('loadedmetadata');
+  await h.receive('play');
+  media.readyState = 2;
+  media.emit('stalled');
+  media.currentTime = 1;
+  media.emit('timeupdate');
+  assert.equal(h.events.filter(e => e.type === 'state').at(-1).buffering, true);
+  media.readyState = 3;
+  media.emit('timeupdate'); // Clock still stopped.
+  assert.equal(h.events.filter(e => e.type === 'state').at(-1).buffering, true);
+  media.paused = true;
+  media.currentTime = 2;
+  media.emit('timeupdate');
+  assert.equal(h.events.filter(e => e.type === 'state').at(-1).buffering, true);
+  media.paused = false;
+  media.seeking = true;
+  media.currentTime = 3;
+  media.emit('timeupdate');
+  assert.equal(h.events.filter(e => e.type === 'state').at(-1).buffering, true);
+  media.seeking = false;
+  media.currentTime = 4;
+  media.emit('timeupdate');
+  assert.equal(h.events.filter(e => e.type === 'state').at(-1).buffering, false);
+});
+
+test('buffer state preserves real gaps and position query acknowledges actual paused media time', async () => {
+  const h = harness({nativeHls: true});
+  await h.receive('open', source);
+  h.media().emit('loadedmetadata');
+  h.media().currentTime = 2;
+  h.media().buffered = {length: 2, start: i => [1, 7][i], end: i => [4, 10][i]};
+  h.media().emit('progress');
+  const state = h.events.filter(e => e.type === 'state').at(-1);
+  assert.deepEqual(state.bufferedRanges, [{startMs: 1000, endMs: 4000}, {startMs: 7000, endMs: 10000}]);
+  assert.equal(state.bufferedPositionMs, 4000);
+  h.media().currentTime = 3.456;
+  await h.receive('getPosition', {}, 31);
+  assert.equal(h.events.find(e => e.type === 'ack' && e.request === 31).data, 3456);
+  assert.equal(h.media().paused, true);
+  // The query doesn't need or fabricate a periodic state update.
+  assert.equal(h.events.filter(e => e.type === 'state').at(-1).positionMs, 2000);
+  await h.receive('open', source, 32);
+  assert.deepEqual(h.events.filter(e => e.type === 'state').at(-1).bufferedRanges, []);
+  await h.receive('getPosition', {}, 33);
+  assert.equal(h.events.find(e => e.type === 'ack' && e.request === 33).ok, false);
+});
+
 test('native HLS preferred; fallback uses bundled HLS with sanitized fatal errors', async () => {
   const native = harness({nativeHls: true, hls: true});
   await native.receive('open', source);

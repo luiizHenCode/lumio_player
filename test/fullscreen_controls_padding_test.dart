@@ -15,7 +15,7 @@ void main() {
       addTearDown(tester.view.resetDevicePixelRatio);
       addTearDown(tester.view.resetPhysicalSize);
       final controller = TestController()
-        ..value = const LumioPlayerState(
+        ..value = LumioPlayerState(
           initialized: true,
           duration: Duration(minutes: 1),
         );
@@ -55,7 +55,7 @@ void main() {
   for (final placement in LumioControlsPlacement.values) {
     testWidgets('inline $placement keeps the existing padding', (tester) async {
       final controller = TestController()
-        ..value = const LumioPlayerState(
+        ..value = LumioPlayerState(
           initialized: true,
           duration: Duration(minutes: 1),
         );
@@ -87,7 +87,7 @@ void main() {
     tester,
   ) async {
     final controller = TestController()
-      ..value = const LumioPlayerState(
+      ..value = LumioPlayerState(
         initialized: true,
         duration: Duration(minutes: 1),
       );

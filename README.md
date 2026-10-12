@@ -288,6 +288,7 @@ A API pública é exportada por `lib/lumio_player.dart`: models, `LumioPlayerCon
 | `open(source)` | Substitui a fonte e espera inicialização |
 | `play()` / `pause()` | Exigem mídia inicializada |
 | `seekTo(Duration)` | Posição não negativa; backend decide limites/seek real |
+| `getPosition()` | Consulta a posição atual no backend; `Future<Duration?>`, null antes de inicializar |
 | `seekToLive()` | Retorna à posição live do backend quando há fonte/janela live compatível |
 | `setVolume(double)` | Finito, entre 0 e 1; iOS WebView aceita somente 0/1 |
 | `setSpeed(double)` | Dart exige finito e positivo; limites específicos abaixo |
@@ -298,22 +299,53 @@ A API pública é exportada por `lib/lumio_player.dart`: models, `LumioPlayerCon
 | `failureReport()` | `Future<LumioFailureReport?>`: relatório seguro da falha atual/última, inclusive após dispose |
 | `dispose()` | Libera recursos e rejeita novas operações |
 
-Comandos são serializados. Uma falha não envenena a fila dos comandos seguintes. Os comandos despachados à engine **nativa** têm espera limitada por `configuration.initializationTimeout`; timeout produz `LumioPlayerError(code: 'command_timeout', ...)`. A WebView mantém seus próprios limites de operação. Isso limita a espera, não cancela o método já em execução na plataforma.
+Comandos são serializados. Uma falha não envenena a fila dos comandos seguintes. Comandos nativos e WebView usam `configuration.commandTimeout`; timeout produz `LumioPlayerError(code: 'command_timeout', ...)`. `getPosition()` e consultas nativas de `diagnostics()` também usam esse limite e propagam `TimeoutException`. Isso limita a espera, não cancela o método já em execução na plataforma.
+
+`initializationTimeout` continua sendo o orçamento de create/open/readiness e início de playlist. O parâmetro opcional `Duration? commandTimeout` tem getter efetivo `Duration`: quando omitido (ou null), usa `initializationTimeout`, preservando os callers existentes. Ambos devem ser positivos e aparecem como `initializationTimeoutMs`/`commandTimeoutMs` na configuração do relatório técnico. Por exemplo, DVR pode usar `const LumioPlayerConfiguration(initializationTimeout: Duration(seconds: 60), commandTimeout: Duration(seconds: 25))` sem reduzir o orçamento de abertura.
 
 Retry, troca de engine e fallback preservam a **intenção explícita de reprodução** (`play`/`pause`), não apenas `state.playing`: uma reprodução em buffering não é confundida com pausa, e retry após pausa permanece pausado. Uma nova chamada `open` reaplica `configuration.autoPlay`. A restauração de posição VOD/continuidade ainda é uma tentativa, não uma transição sem interrupções nem preservação garantida de sessão/autenticação.
 
 Configuração é imutável: para alterar `mode`, buffer, timeout ou opções de decoder/live, crie outro controller, desmonte a superfície anterior e descarte o anterior.
+
+### Buffer real, posição sob demanda e superfície nativa
+
+`controller.value.buffered` expõe uma lista imutável de `LumioBufferedRange(start: ..., end: ...)`. iOS usa os intervalos de `AVPlayerItem.loadedTimeRanges`, WebView os de `HTMLMediaElement.buffered`. Android/Media3 disponibiliza apenas o intervalo conhecido entre `currentPosition` e `bufferedPosition`; não se inferem trechos desde zero, caches anteriores ou gaps inexistentes. O campo `bufferedPosition` permanece disponível para compatibilidade. As trocas de fonte/engine/item limpam os ranges anteriores; os controles pintam somente os intervalos conhecidos.
+
+```dart
+final ranges = player.value.buffered;
+final Duration? actualPosition = await player.getPosition();
+```
+
+A consulta usa `currentTime()` no iOS, `currentPosition` no Android e `currentTime` no HTML. Retorna `null` antes de inicializar e rejeita resultados obsoletos após troca de fonte/engine/item ou descarte. Não garante precisão frame a frame. Os comandos continuam serializados e a consulta respeita o timeout configurado.
+
+Para experimentar renderização nativa sem textura, crie outro controller:
+
+```dart
+final player = LumioPlayerController(
+  configuration: const LumioPlayerConfiguration(
+    nativeViewType: LumioNativeViewType.platformView,
+  ),
+);
+```
+
+O padrão continua `LumioNativeViewType.texture`. A opção `platformView` usa `SurfaceView` no Android e `AVPlayerLayer` no iOS, com o mesmo player nativo e sem registro de textura. `LumioPlayerView` escolhe `AndroidView`/`UiKitView` e mantém uma única superfície no fullscreen. Desmontar a view não descarta o player; a view mais recente assume a superfície e callbacks antigos não desligam a nova. Fallback para WebView continua disponível quando elegível; a preferência só se aplica ao engine nativo.
+
+Consulte `capabilities.nativePlatformView` para suporte e `capabilities.supportsSurfaceCapture` antes de tentar captura por `RepaintBoundary`: Platform Views e WebViews não são capturadas por esse mecanismo. Zoom, clipping, fullscreen, overlays e desempenho precisam de validação em dispositivos reais; esse modo não é uma correção universal para falhas de codec/rede. Trocar `nativeViewType` exige um novo controller.
+
+**Migração:** `LumioPlayerState` agora copia defensivamente a lista de buffer; seu construtor não é mais `const`. Remova `const` das instanciações diretas. A integração exige atualizar Dart, assets e backends nativos juntos; mudanças nativas precisam de rebuild completo, não apenas hot reload.
 
 ### Defaults da API Dart
 
 | Opção | Default |
 | --- | --- |
 | `engine` | `LumioPlaybackEngine.automatic` |
+| `nativeViewType` | `LumioNativeViewType.texture` |
 | `mode` | `LumioPlaybackMode.video` |
 | `autoPlay` | `true` |
 | `looping` | `false` |
 | `volume` / `speed` | `1` / `1` |
 | `initializationTimeout` | 25 segundos |
+| `commandTimeout` | `initializationTimeout` quando omitido |
 | `allowAutomaticFallback` | `true` |
 | `enableDecoderFallback` | `true` — aplicado somente no Android nativo |
 | `liveTargetOffset` | `null` — opcional; `Duration` entre 0 e 60 segundos |
@@ -770,12 +802,13 @@ A bridge usa intencionalmente **`MethodChannel` e `EventChannel` manuais, não P
 
 - Métodos: `lumio_player/methods`.
 - Eventos compartilhados: `lumio_player/events`, roteados pelo `id` do player.
-- `create` retorna `{id, textureId}`.
+- `create` retorna `{id, textureId}` por padrão. No iOS, aceita `viewType: 'texture' | 'platformView'` (default `texture`); `platformView` retorna apenas `{id}` e monta `lumio_player/native_view` via `UiKitView`, `creationParams: {'id': id}` e `StandardMessageCodec`. É opt-in do protocolo bruto, ainda não exposto pela API Dart pública.
+- No iOS, `getPosition({'id': id})` retorna Int64 em ms, não negativo (zero antes de abrir). Eventos `state` acrescentam `bufferedRanges: [{startMs, endMs}]` para todos os intervalos carregados válidos, sem assumir início zero; `bufferedPositionMs` é preservado.
 - `open`, `play`, `pause`, `seek`, `seekToLive`, `volume`, `speed`, `looping`, `diagnostics` e `dispose` usam mapas com `id`; `open` recebe `source` e `config`.
 - `open` no protocolo nativo confirma despacho; o controller público espera os eventos de inicialização/erro.
 - Eventos `state` e `error` carregam estado/código e identificador. A bridge WebView usa mensagens JSON e acknowledgments próprios, sem expor `id` nativo.
 
-Android usa textura Flutter `SurfaceProducer` com rebind em disponibilidade/cleanup da superfície. iOS usa `AVPlayerItemVideoOutput`, pixel buffers BGRA e `CADisplayLink`; áudio sem vídeo não aloca display link. Desacoplamento do Flutter engine libera players. No iOS, se a categoria ainda for `soloAmbient`, o plugin seleciona `playback` com `mixWithOthers`; preserva sessão previamente configurada pelo host. Há tratamento de interrupções/remoção de saída de áudio, mas isso não constitui serviço de background.
+Android usa textura Flutter `SurfaceProducer` com rebind em disponibilidade/cleanup da superfície. iOS usa por padrão `AVPlayerItemVideoOutput`, pixel buffers BGRA e `CADisplayLink`; o modo opt-in `platformView` usa `AVPlayerLayer` no mesmo `AVQueuePlayer`, sem textura/polling de frames, e desmontar a view não descarta o player; áudio sem vídeo não aloca display link. Desacoplamento do Flutter engine libera players. No iOS, se a categoria ainda for `soloAmbient`, o plugin seleciona `playback` com `mixWithOthers`; preserva sessão previamente configurada pelo host. Há tratamento de interrupções/remoção de saída de áudio, mas isso não constitui serviço de background.
 
 Detalhes adicionais: [Android](android/README.md), [iOS](ios/README.md) e [WebView](assets/web/README.md). As notas nativas sobre Dart ainda ser scaffold/ausência de registro do exemplo são históricas: a API Dart e a declaração de plugin já existem. Seus defaults de canal bruto não substituem os defaults públicos documentados acima.
 
@@ -842,6 +875,7 @@ mkdir -p ios/.native-validation
 xcrun --sdk macosx swiftc -swift-version 5 -warnings-as-errors \
   ios/lumio_player/Sources/lumio_player/LumioConfiguration.swift \
   ios/lumio_player/Sources/lumio_player/LumioLiveSeek.swift \
+  ios/lumio_player/Sources/lumio_player/LumioTimeline.swift \
   ios/Tests/ConfigurationTests.swift -o ios/.native-validation/configuration-tests
 ios/.native-validation/configuration-tests
 xcrun --sdk macosx swiftc -swift-version 5 -warnings-as-errors \

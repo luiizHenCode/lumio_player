@@ -52,6 +52,40 @@ void main() {
     native.uninstall();
   });
 
+  test(
+    'failure snapshot preserves both timeout budgets as safe numbers',
+    () async {
+      await player.dispose();
+      player = LumioPlayerController(
+        configuration: const LumioPlayerConfiguration(
+          engine: LumioPlaybackEngine.native,
+          allowAutomaticFallback: false,
+          initializationTimeout: Duration(seconds: 60),
+          commandTimeout: Duration(seconds: 25),
+        ),
+      );
+      await player.open(source);
+      diagnostics = {
+        'initializationTimeoutMs': 60000,
+        'commandTimeoutMs': 25000,
+        'details': {
+          'initializationTimeoutMs': double.infinity,
+          'commandTimeoutMs': 'private-token',
+        },
+      };
+      await emit();
+      final report = (await player.failureReport())!;
+      final config = report.metadata['configuration'] as Map;
+      expect(config['initializationTimeoutMs'], 60000);
+      expect(config['commandTimeoutMs'], 25000);
+      expect(report.metadata['native'], {
+        'initializationTimeoutMs': 60000,
+        'commandTimeoutMs': 25000,
+        'details': <String, Object?>{},
+      });
+    },
+  );
+
   for (final code in const [
     // Public codes from web_engine.dart and player.js, not HLS.js internals.
     'media_failed',

@@ -24,6 +24,10 @@ public final class LumioPlayerPlugin: NSObject, FlutterPlugin, FlutterStreamHand
     let events = FlutterEventChannel(name: "lumio_player/events", binaryMessenger: registrar.messenger())
     events.setStreamHandler(instance)
     instance.events = events
+    registrar.register(LumioPlayerViewFactory { [weak instance] id in
+      guard let instance = instance, !instance.detached else { return nil }
+      return instance.players[id]
+    }, withId: "lumio_player/native_view")
   }
 
   public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
@@ -37,16 +41,28 @@ public final class LumioPlayerPlugin: NSObject, FlutterPlugin, FlutterStreamHand
     }
     let arguments = call.arguments as? [String: Any] ?? [:]
     if call.method == "create" {
-      let id = nextID
-      nextID += 1
-      let player = LumioNativePlayer(id: id, registry: registrar.textures()) { [weak self] event in
-        self?.eventSink?(event)
+      do {
+        if let raw = call.arguments, !(raw is [String: Any]) {
+          throw LumioFailure("invalid_argument", "create arguments must be a map.")
+        }
+        let viewType = try LumioViewType.parse(arguments)
+        let id = nextID
+        nextID += 1
+        let player = LumioNativePlayer(id: id, registry: registrar.textures(), viewType: viewType) { [weak self] event in
+          self?.eventSink?(event)
+        }
+        players[id] = player
+        var response: [String: Any] = ["id": id]
+        if viewType == .texture { response["textureId"] = player.textureID }
+        result(response)
+      } catch let failure as LumioFailure {
+        result(FlutterError(code: failure.code, message: failure.message, details: failure.details))
+      } catch {
+        result(FlutterError(code: "native_error", message: "Player creation failed.", details: nil))
       }
-      players[id] = player
-      result(["id": id, "textureId": player.textureID])
       return
     }
-    let known = ["open", "openPlaylist", "selectPlaylistItem", "play", "pause", "seek", "seekToLive", "volume", "speed", "looping", "dispose", "diagnostics"]
+    let known = ["open", "openPlaylist", "selectPlaylistItem", "play", "pause", "seek", "seekToLive", "volume", "speed", "looping", "dispose", "diagnostics", "getPosition"]
     guard known.contains(call.method) else {
       result(FlutterMethodNotImplemented)
       return
@@ -115,6 +131,7 @@ public final class LumioPlayerPlugin: NSObject, FlutterPlugin, FlutterStreamHand
         player.dispose()
         result(nil)
       case "diagnostics": result(player.diagnostics())
+      case "getPosition": result(player.getPosition())
       default: result(FlutterMethodNotImplemented)
       }
     } catch let failure as LumioFailure {

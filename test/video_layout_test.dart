@@ -9,10 +9,7 @@ void main() {
     'default layout follows video ratio and explicit override is respected',
     (tester) async {
       final controller = TestController()
-        ..value = const LumioPlayerState(
-          initialized: true,
-          size: Size(640, 480),
-        );
+        ..value = LumioPlayerState(initialized: true, size: Size(640, 480));
       Widget host({double? ratio, BoxFit? fit}) => MaterialApp(
         home: Scaffold(
           body: Center(
@@ -51,7 +48,7 @@ void main() {
     'expand fills finite available area and dynamic fit does not reopen media',
     (tester) async {
       final controller = TestController()
-        ..value = const LumioPlayerState(
+        ..value = LumioPlayerState(
           initialized: true,
           size: Size(640, 360),
           position: Duration(seconds: 5),

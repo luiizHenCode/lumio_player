@@ -176,6 +176,7 @@ void main() {
         'volume': 1.0,
         'speed': 1.0,
         'initializationTimeoutMs': 25000,
+        'commandTimeoutMs': 25000,
         'enableDecoderFallback': true,
         'audioPolicy': 'preserveHost',
         'allowBackgroundPlayback': false,
@@ -192,6 +193,8 @@ void main() {
       expect(live.validate, returnsNormally);
       expect(live.toMap()['live'], isTrue);
       expect(live.toMap()['initializationTimeoutMs'], 123);
+      expect(live.commandTimeout, live.initializationTimeout);
+      expect(live.toMap()['commandTimeoutMs'], 123);
       expect(live.toMap()['autoPlay'], isFalse);
       expect(live.toMap()['looping'], isTrue);
       expect(
@@ -256,6 +259,10 @@ void main() {
           LumioPlayerConfiguration(initializationTimeout: timeout).validate,
           throwsArgumentError,
         );
+        expect(
+          LumioPlayerConfiguration(commandTimeout: timeout).validate,
+          throwsArgumentError,
+        );
       }
       expect(
         const LumioPlayerConfiguration(
@@ -270,9 +277,30 @@ void main() {
     });
   });
 
+  test('command timeout is optional, const and independent when specified', () {
+    const defaults = LumioPlayerConfiguration();
+    const legacy = LumioPlayerConfiguration(
+      initializationTimeout: Duration(milliseconds: 7),
+    );
+    const independent = LumioPlayerConfiguration(
+      initializationTimeout: Duration(seconds: 60),
+      commandTimeout: Duration(seconds: 25),
+    );
+    const explicitNull = LumioPlayerConfiguration(
+      initializationTimeout: Duration(milliseconds: 7),
+      commandTimeout: null,
+    );
+    expect(defaults.commandTimeout, const Duration(seconds: 25));
+    expect(legacy.commandTimeout, legacy.initializationTimeout);
+    expect(explicitNull.commandTimeout, legacy.commandTimeout);
+    expect(independent.validate, returnsNormally);
+    expect(independent.toMap()['initializationTimeoutMs'], 60000);
+    expect(independent.toMap()['commandTimeoutMs'], 25000);
+  });
+
   group('LumioPlayerState', () {
     test('defaults and aspect ratio fallback for zero/invalid size', () {
-      const state = LumioPlayerState();
+      final state = LumioPlayerState();
       expect(state.initialized, isFalse);
       expect(state.playing, isFalse);
       expect(state.buffering, isFalse);
@@ -302,7 +330,7 @@ void main() {
       () {
         const error = LumioPlayerError(code: 'first', message: 'Failure');
         const replacement = LumioPlayerError(code: 'second', message: 'Other');
-        const state = LumioPlayerState(
+        final state = LumioPlayerState(
           initialized: true,
           playing: true,
           buffering: true,
@@ -345,7 +373,7 @@ void main() {
 
     test('partial events merge numeric fields without discarding state', () {
       const error = LumioPlayerError(code: 'test', message: 'Failure');
-      const initial = LumioPlayerState(
+      final initial = LumioPlayerState(
         initialized: true,
         transitioning: true,
         duration: Duration(seconds: 10),

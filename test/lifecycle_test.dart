@@ -13,11 +13,12 @@ import 'controller_test.dart' show NativeMock;
 
 class _WebPlatform extends WebViewPlatform {
   late _WebController web;
+  bool autoOpenAck = true;
 
   @override
   PlatformWebViewController createPlatformWebViewController(
     PlatformWebViewControllerCreationParams params,
-  ) => web = _WebController(params);
+  ) => web = (_WebController(params)..autoOpenAck = autoOpenAck);
 
   @override
   PlatformNavigationDelegate createPlatformNavigationDelegate(
@@ -43,16 +44,19 @@ class _WebController extends PlatformWebViewController {
   late JavaScriptChannelParams channel;
   final requests = <Map<String, dynamic>>[];
   bool autoDisposeAck = true;
+  bool autoOpenAck = true;
 
   void emit(Map<String, Object?> event) =>
       channel.onMessageReceived(JavaScriptMessage(message: jsonEncode(event)));
 
-  void ack(Map<String, dynamic> request, {bool ok = true}) => emit({
-    'type': 'ack',
-    'request': request['request'],
-    'ok': ok,
-    if (!ok) 'code': 'cleanup_failed',
-  });
+  void ack(Map<String, dynamic> request, {bool ok = true, Object? data}) =>
+      emit({
+        'type': 'ack',
+        'request': request['request'],
+        'ok': ok,
+        'data': ?data,
+        if (!ok) 'code': 'cleanup_failed',
+      });
 
   @override
   Future<void> setJavaScriptMode(JavaScriptMode mode) async {}
@@ -81,7 +85,7 @@ class _WebController extends PlatformWebViewController {
       jsonDecode(jsonDecode(literal) as String) as Map,
     );
     requests.add(request);
-    if (request['method'] == 'open') {
+    if (request['method'] == 'open' && autoOpenAck) {
       emit({'type': 'state', 'initialized': true, 'buffering': false});
       ack(request);
     } else if (request['method'] == 'dispose' && autoDisposeAck) {
@@ -110,12 +114,16 @@ void main() {
   LumioPlayerController player({
     LumioPlaybackEngine engine = LumioPlaybackEngine.native,
     LumioLogger? logger,
+    bool fallback = false,
+    Duration initializationTimeout = const Duration(seconds: 20),
+    Duration? commandTimeout,
   }) {
     final controller = LumioPlayerController(
       configuration: LumioPlayerConfiguration(
         engine: engine,
-        allowAutomaticFallback: false,
-        initializationTimeout: const Duration(seconds: 20),
+        allowAutomaticFallback: fallback,
+        initializationTimeout: initializationTimeout,
+        commandTimeout: commandTimeout,
       ),
       logger: logger,
     );
@@ -132,6 +140,138 @@ void main() {
 
     await opening;
   }
+
+  testWidgets('web slow open is independent of command deadline', (
+    tester,
+  ) async {
+    final controller = player(
+      engine: LumioPlaybackEngine.webview,
+      commandTimeout: const Duration(seconds: 2),
+    );
+    platform.autoOpenAck = false;
+    final opening = controller.open(source);
+    await _flush(tester);
+    await tester.pump(const Duration(seconds: 3));
+    final request = platform.web.requests.singleWhere(
+      (r) => r['method'] == 'open',
+    );
+    platform.web.emit({
+      'type': 'state',
+      'initialized': true,
+      'buffering': false,
+    });
+    platform.web.ack(request);
+    await _flush(tester);
+    await opening;
+    expect(controller.value.initialized, isTrue);
+    await controller.dispose();
+  });
+
+  testWidgets('web command can outlast initialization and old fixed deadline', (
+    tester,
+  ) async {
+    final controller = player(
+      engine: LumioPlaybackEngine.webview,
+      initializationTimeout: const Duration(seconds: 1),
+      commandTimeout: const Duration(seconds: 25),
+    );
+    await open(tester, controller);
+    final playing = controller.play();
+    await _flush(tester);
+    await tester.pump(const Duration(seconds: 11));
+    final request = platform.web.requests.last;
+    expect(request['method'], 'play');
+    platform.web.ack(request);
+    await _flush(tester);
+    await playing;
+    await controller.dispose();
+  });
+
+  testWidgets('web omitted command timeout follows initialization timeout', (
+    tester,
+  ) async {
+    final controller = player(
+      engine: LumioPlaybackEngine.webview,
+      initializationTimeout: const Duration(seconds: 1),
+    );
+    await open(tester, controller);
+    final failed = expectLater(
+      controller.play(),
+      throwsA(
+        isA<LumioPlayerError>().having(
+          (error) => error.code,
+          'code',
+          'command_timeout',
+        ),
+      ),
+    );
+    await _flush(tester);
+    await tester.pump(const Duration(seconds: 1));
+    await _flush(tester);
+    await failed;
+    await controller.dispose();
+  });
+
+  for (final method in ['play', 'seek', 'getPosition']) {
+    testWidgets('web $method uses configured command deadline', (tester) async {
+      final controller = player(
+        engine: LumioPlaybackEngine.webview,
+        commandTimeout: const Duration(seconds: 2),
+      );
+      await open(tester, controller);
+      final Future<Object?> action = switch (method) {
+        'play' => controller.play(),
+        'seek' => controller.seekTo(const Duration(seconds: 3)),
+        _ => controller.getPosition(),
+      };
+      final failed = expectLater(
+        action,
+        method == 'getPosition'
+            ? throwsA(isA<TimeoutException>())
+            : throwsA(
+                isA<LumioPlayerError>().having(
+                  (error) => error.code,
+                  'code',
+                  'command_timeout',
+                ),
+              ),
+      );
+      await _flush(tester);
+      await tester.pump(const Duration(seconds: 2));
+      await _flush(tester);
+      await failed;
+      expect(
+        platform.web.requests.where((r) => r['method'] == method),
+        hasLength(1),
+      );
+      expect(
+        (await controller.diagnostics())['native'],
+        containsPair('pendingRequests', 0),
+      );
+      await controller.dispose();
+    });
+  }
+
+  testWidgets('initialization timeout still permits automatic fallback', (
+    tester,
+  ) async {
+    native.initialize = false;
+    final controller = player(
+      engine: LumioPlaybackEngine.automatic,
+      fallback: true,
+      initializationTimeout: const Duration(seconds: 1),
+      commandTimeout: const Duration(milliseconds: 100),
+    );
+    final opening = controller.open(source);
+    await _flush(tester);
+    await tester.pump(const Duration(seconds: 1));
+    await _flush(tester);
+    await opening;
+    expect(controller.value.engine, LumioPlaybackEngine.webview);
+    expect(controller.value.initialized, isTrue);
+    expect((await controller.diagnostics())['fallbackUsed'], isTrue);
+    await controller.dispose();
+  });
 
   setUp(() {
     native = NativeMock()..install();
@@ -485,6 +625,105 @@ void main() {
       expect(_codes(entries), isNot(contains('dispose_failed')));
     },
   );
+
+  testWidgets('WebView position uses ACK data rather than cached events', (
+    tester,
+  ) async {
+    final controller = player(engine: LumioPlaybackEngine.webview);
+    await open(tester, controller);
+    platform.web.emit({'type': 'state', 'positionMs': 1000, 'playing': false});
+    final position = controller.getPosition();
+    await _flush(tester);
+    final request = platform.web.requests.last;
+    expect(request['method'], 'getPosition');
+    // A newer periodic event still isn't the answer to this request.
+    platform.web.emit({'type': 'state', 'positionMs': 2000});
+    platform.web.ack(request, data: 4567);
+    await _flush(tester);
+    expect(await position, const Duration(milliseconds: 4567));
+    expect(controller.value.position, const Duration(milliseconds: 4567));
+    expect(controller.capabilities.supportsSurfaceCapture, isFalse);
+    expect(controller.capabilities.nativePlatformView, isFalse);
+    final closing = controller.dispose();
+    await _flush(tester);
+    await closing;
+    await expectLater(controller.getPosition(), throwsStateError);
+  });
+
+  testWidgets('source replacement rejects late WebView position data', (
+    tester,
+  ) async {
+    final controller = player(engine: LumioPlaybackEngine.webview);
+    await open(tester, controller);
+    final position = expectLater(controller.getPosition(), throwsStateError);
+    await _flush(tester);
+    final oldWeb = platform.web;
+    final request = oldWeb.requests.last;
+    final reopening = controller.open(source);
+    oldWeb.ack(request, data: 9876);
+    await _flush(tester);
+    await position;
+    await reopening;
+    expect(controller.value.position, Duration.zero);
+    final closing = controller.dispose();
+    await _flush(tester);
+    await closing;
+  });
+
+  testWidgets(
+    'fallback rejects pending native position and clears old buffers',
+    (tester) async {
+      final controller = LumioPlayerController(
+        configuration: const LumioPlayerConfiguration(autoPlay: false),
+      );
+      await open(tester, controller);
+      controller.value = controller.value.apply({
+        'bufferedPositionMs': 9000,
+        'bufferedRanges': [
+          {'startMs': 0, 'endMs': 9000},
+        ],
+      });
+      final reply = Completer<Object?>();
+      native.intercept = (call) =>
+          call.method == 'getPosition' ? reply.future : native.respond(call);
+      final position = expectLater(controller.getPosition(), throwsStateError);
+      await _flush(tester);
+      await native.emit({
+        'id': controller.nativePlayerId,
+        'type': 'error',
+        'code': 'decoder_failed',
+      });
+      await _flush(tester);
+      reply.complete(9876);
+      // Failure snapshots are deliberately scheduled on the next timer turn.
+      await tester.pump(const Duration(milliseconds: 1));
+      await _flush(tester);
+      await position;
+      expect(controller.value.engine, LumioPlaybackEngine.webview);
+      expect(controller.value.position, Duration.zero);
+      expect(controller.value.buffered, isEmpty);
+      expect(controller.value.bufferedPosition, Duration.zero);
+      expect(controller.nativePlayerId, isNull);
+      expect(controller.capabilities.supportsSurfaceCapture, isFalse);
+      final closing = controller.dispose();
+      await _flush(tester);
+      await closing;
+    },
+  );
+
+  testWidgets('dispose rejects late WebView position data', (tester) async {
+    final controller = player(engine: LumioPlaybackEngine.webview);
+    await open(tester, controller);
+    final position = expectLater(controller.getPosition(), throwsStateError);
+    await _flush(tester);
+    final request = platform.web.requests.last;
+    final closing = controller.dispose();
+    platform.web.ack(request, data: 9876);
+    await _flush(tester);
+    await position;
+    await closing;
+    expect(controller.value.position, Duration.zero);
+  });
 
   testWidgets(
     'WebView dispose cancels pending command and ignores its late ACK',

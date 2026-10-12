@@ -31,6 +31,18 @@ func lumioPlaylistIndex(_ map: [String: Any], length: Int) throws -> Int {
   return Int(value)
 }
 
+enum LumioViewType: String {
+  case texture, platformView
+
+  static func parse(_ arguments: [String: Any]) throws -> LumioViewType {
+    guard let raw = arguments["viewType"] else { return .texture }
+    guard let name = raw as? String, let type = LumioViewType(rawValue: name) else {
+      throw LumioFailure("invalid_argument", "viewType must be texture or platformView.")
+    }
+    return type
+  }
+}
+
 enum LumioAudioPolicy: String, CaseIterable {
   case preserveHost, mixWithOthers, exclusive
 }

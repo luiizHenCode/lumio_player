@@ -1,6 +1,8 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
 import 'controller.dart';
@@ -144,8 +146,9 @@ class LumioPlayerView extends StatefulWidget {
   final LumioPlaceholderBuilder? placeholder;
   final LumioErrorBuilder? errorBuilder;
 
-  /// Native frame capture boundary, excluding the controls. WebViews require
-  /// platform/HTML capture rather than Flutter repaint-boundary screenshots.
+  /// Texture frame capture boundary, excluding the controls. Native platform
+  /// views and WebViews cannot be captured by a RepaintBoundary. Consult
+  /// controller.capabilities.supportsSurfaceCapture before taking screenshots.
   final GlobalKey? surfaceCaptureKey;
 
   /// Must preserve the finite constraints of the media area.
@@ -610,6 +613,27 @@ class _LumioPlayerViewState extends State<LumioPlayerView> {
     }
   }
 
+  Widget _nativeSurface(int id) {
+    // Platform views are composed outside Flutter's repaint layer and cannot
+    // be captured by surfaceCaptureKey/RepaintBoundary. Fullscreen transfers
+    // ownership only after the previous platform view has been unmounted.
+    final key = ValueKey('lumio-native-view-$id');
+    if (defaultTargetPlatform == TargetPlatform.android) {
+      return AndroidView(
+        key: key,
+        viewType: 'lumio_player/native_view',
+        creationParams: {'id': id},
+        creationParamsCodec: const StandardMessageCodec(),
+      );
+    }
+    return UiKitView(
+      key: key,
+      viewType: 'lumio_player/native_view',
+      creationParams: {'id': id},
+      creationParamsCodec: const StandardMessageCodec(),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     if (_fullscreenRouteActive) {
@@ -618,10 +642,15 @@ class _LumioPlayerViewState extends State<LumioPlayerView> {
     final state = _controller.value;
     final web = _controller.webViewController;
     final texture = _controller.textureId;
+    final nativeId = _controller.nativePlayerId;
+    final platformView =
+        nativeId != null &&
+        _controller.nativeViewType == LumioNativeViewType.platformView &&
+        _controller.capabilities.nativePlatformView;
     final audio = _controller.configuration.mode == LumioPlaybackMode.audio;
     final live =
         _live(_controller) || _config.layout == LumioControlsLayout.live;
-    final hasSurface = web != null || texture != null;
+    final hasSurface = web != null || texture != null || platformView;
     final size = state.size.width > 0 && state.size.height > 0
         ? state.size
         : const Size(1600, 900);
@@ -737,6 +766,15 @@ class _LumioPlayerViewState extends State<LumioPlayerView> {
                               ? WebViewWidget(
                                   key: ObjectKey(web),
                                   controller: web,
+                                )
+                              : platformView
+                              ? FittedBox(
+                                  fit: widget.fit ?? _controller.videoFit,
+                                  child: SizedBox(
+                                    width: size.width,
+                                    height: size.height,
+                                    child: _nativeSurface(nativeId),
+                                  ),
                                 )
                               : texture != null
                               ? FittedBox(
@@ -975,6 +1013,76 @@ class _LumioPlayerViewState extends State<LumioPlayerView> {
           aspectRatio: widget.aspectRatio ?? _controller.value.aspectRatio,
           child: child,
         );
+}
+
+class _BufferedSliderTrackShape extends RectangularSliderTrackShape {
+  const _BufferedSliderTrackShape({
+    required this.ranges,
+    required this.duration,
+    required this.color,
+  });
+
+  final List<LumioBufferedRange> ranges;
+  final Duration duration;
+  final Color color;
+
+  @override
+  void paint(
+    PaintingContext context,
+    Offset offset, {
+    required RenderBox parentBox,
+    required SliderThemeData sliderTheme,
+    required Animation<double> enableAnimation,
+    required TextDirection textDirection,
+    required Offset thumbCenter,
+    Offset? secondaryOffset,
+    bool isDiscrete = false,
+    bool isEnabled = false,
+  }) {
+    super.paint(
+      context,
+      offset,
+      parentBox: parentBox,
+      sliderTheme: sliderTheme,
+      enableAnimation: enableAnimation,
+      textDirection: textDirection,
+      thumbCenter: thumbCenter,
+      secondaryOffset: secondaryOffset,
+      isDiscrete: isDiscrete,
+      isEnabled: isEnabled,
+    );
+    if (duration <= Duration.zero) return;
+    final rect = getPreferredRect(
+      parentBox: parentBox,
+      offset: offset,
+      sliderTheme: sliderTheme,
+      isEnabled: isEnabled,
+      isDiscrete: isDiscrete,
+    );
+    final rtl = textDirection == TextDirection.rtl;
+    double x(Duration time) {
+      final fraction = (time.inMicroseconds / duration.inMicroseconds).clamp(
+        0.0,
+        1.0,
+      );
+      return rect.left + rect.width * (rtl ? 1 - fraction : fraction);
+    }
+
+    final paint = Paint()..color = color;
+    for (final range in ranges) {
+      final left = rtl ? x(range.end) : x(range.start);
+      final right = rtl ? x(range.start) : x(range.end);
+      // Keep played progress intact; paint only known intervals ahead of it.
+      final visibleLeft = rtl ? left : left.clamp(thumbCenter.dx, rect.right);
+      final visibleRight = rtl ? right.clamp(rect.left, thumbCenter.dx) : right;
+      if (visibleRight > visibleLeft) {
+        context.canvas.drawRect(
+          Rect.fromLTRB(visibleLeft, rect.top, visibleRight, rect.bottom),
+          paint,
+        );
+      }
+    }
+  }
 }
 
 /// Can be mounted independently of the view, with its own configuration.
@@ -1353,6 +1461,11 @@ class _LumioPlayerControlsState extends State<LumioPlayerControls> {
             valueListenable: _controller,
             builder: (context, state, _) {
               final enabled = _ready(state);
+              final compactLoading =
+                  _config.compact &&
+                  (!state.initialized || state.transitioning) &&
+                  state.error == null;
+              final auxiliaryEnabled = !compactLoading;
               final live =
                   _live(_controller) ||
                   _config.layout == LumioControlsLayout.live;
@@ -1437,14 +1550,21 @@ class _LumioPlayerControlsState extends State<LumioPlayerControls> {
                   iconSize: (buttonExtent * .6).clamp(18.0, 24.0),
                   padding: EdgeInsets.zero,
                   constraints: const BoxConstraints(),
-                  style: const ButtonStyle(
-                    minimumSize: WidgetStatePropertyAll(Size.zero),
+                  style: ButtonStyle(
+                    foregroundColor: WidgetStateProperty.resolveWith(
+                      (states) => states.contains(WidgetState.disabled)
+                          ? _config.foregroundColor.withValues(alpha: .55)
+                          : _config.foregroundColor,
+                    ),
+                    minimumSize: const WidgetStatePropertyAll(Size.zero),
                     tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                   ),
                   onPressed: action,
                 ),
               );
-              if (widget.compacted) {
+              // Temporarily reveal disabled controls during startup/reopening,
+              // without overwriting the host's compact presentation choice.
+              if (widget.compacted && !compactLoading) {
                 return Material(
                   color: _backgroundColor,
                   child: GestureDetector(
@@ -1490,7 +1610,11 @@ class _LumioPlayerControlsState extends State<LumioPlayerControls> {
                   thumbShape: const RoundSliderThumbShape(
                     enabledThumbRadius: 7,
                   ),
-                  trackShape: const RectangularSliderTrackShape(),
+                  trackShape: _BufferedSliderTrackShape(
+                    ranges: state.buffered,
+                    duration: state.duration,
+                    color: _config.foregroundColor.withValues(alpha: .4),
+                  ),
                   trackGap: 0,
                   inactiveTrackColor: _config.foregroundColor.withValues(
                     alpha: .2,
@@ -1553,6 +1677,8 @@ class _LumioPlayerControlsState extends State<LumioPlayerControls> {
                         : null,
                     style: TextButton.styleFrom(
                       foregroundColor: _config.foregroundColor,
+                      disabledForegroundColor: _config.foregroundColor
+                          .withValues(alpha: .55),
                       padding: const EdgeInsets.symmetric(horizontal: 4),
                       minimumSize: Size.zero,
                       tapTargetSize: MaterialTapTargetSize.shrinkWrap,
@@ -1640,11 +1766,13 @@ class _LumioPlayerControlsState extends State<LumioPlayerControls> {
                       widget.isFullscreen
                           ? Icons.fullscreen_exit
                           : Icons.fullscreen,
-                      () {
-                        widget.beforeCommand?.call();
-                        _notifyInteraction(false);
-                        widget.onToggleFullscreen?.call();
-                      },
+                      auxiliaryEnabled
+                          ? () {
+                              widget.beforeCommand?.call();
+                              _notifyInteraction(false);
+                              widget.onToggleFullscreen?.call();
+                            }
+                          : null,
                     )
                   : null;
               Widget metadata() {
@@ -1711,7 +1839,9 @@ class _LumioPlayerControlsState extends State<LumioPlayerControls> {
                     button(
                       'Previous item',
                       Icons.skip_previous_outlined,
-                      !state.transitioning && _controller.hasPrevious
+                      auxiliaryEnabled &&
+                              !state.transitioning &&
+                              _controller.hasPrevious
                           ? () => _command(_controller.previous)
                           : null,
                     ),
@@ -1719,7 +1849,9 @@ class _LumioPlayerControlsState extends State<LumioPlayerControls> {
                     button(
                       'Next item',
                       Icons.skip_next_outlined,
-                      !state.transitioning && _controller.hasNext
+                      auxiliaryEnabled &&
+                              !state.transitioning &&
+                              _controller.hasNext
                           ? () => _command(_controller.next)
                           : null,
                     ),
@@ -1729,7 +1861,7 @@ class _LumioPlayerControlsState extends State<LumioPlayerControls> {
                 if (_config.showSettings)
                   PopupMenuButton<LumioPlaybackEngine>(
                     tooltip: 'Playback engine',
-                    enabled: !state.transitioning,
+                    enabled: auxiliaryEnabled && !state.transitioning,
                     initialValue: _controller.requestedEngine,
                     onOpened: _menuOpened,
                     onCanceled: _menuClosed,
@@ -1745,14 +1877,19 @@ class _LumioPlayerControlsState extends State<LumioPlayerControls> {
                   button(
                     'Estatísticas para nerds',
                     Icons.analytics_outlined,
-                    () async {
-                      _menuOpened();
-                      try {
-                        await LumioStatisticsView.show(context, _controller);
-                      } finally {
-                        if (mounted) _menuClosed();
-                      }
-                    },
+                    auxiliaryEnabled
+                        ? () async {
+                            _menuOpened();
+                            try {
+                              await LumioStatisticsView.show(
+                                context,
+                                _controller,
+                              );
+                            } finally {
+                              if (mounted) _menuClosed();
+                            }
+                          }
+                        : null,
                   ),
                 if (_config.showRetry && state.error != null)
                   button(

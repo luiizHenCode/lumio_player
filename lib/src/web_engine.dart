@@ -29,12 +29,13 @@ class LumioWebEngine {
   final void Function(Map<String, dynamic>) _onEvent;
   late final WebViewController _controller;
   final Completer<void> _ready = Completer<void>();
-  final Map<int, Completer<void>> _pending = {};
+  final Map<int, Completer<Object?>> _pending = {};
   Map<String, dynamic> _state = {};
   bool _disposed = false;
   Future<void>? _disposal;
   bool _mounted = false;
   int _sequence = 0;
+  Duration _commandTimeout = const Duration(seconds: 25);
   int? _opening;
   int _openGeneration = 0;
   String? _setupError;
@@ -110,7 +111,7 @@ class LumioWebEngine {
           final pending = _pending.remove(event['request']);
           if (pending != null) {
             if (event['ok'] == true) {
-              pending.complete();
+              pending.complete(event['data']);
             } else {
               pending.completeError(
                 LumioPlayerError(
@@ -160,7 +161,8 @@ class LumioWebEngine {
   }
 
   /// [config] accepts live, autoPlay, looping, volume, speed and
-  /// initializationTimeoutMs (default 25000, range 1..120000).
+  /// initializationTimeoutMs (default 25000, range 1..120000) and
+  /// commandTimeoutMs (positive, defaults to initializationTimeoutMs).
   Future<void> open(
     Map<String, Object?> source,
     Map<String, Object?> config,
@@ -200,6 +202,11 @@ class LumioWebEngine {
         'initializationTimeoutMs must be between 1 and 120000.',
       );
     }
+    final commandTimeoutMs = config['commandTimeoutMs'] ?? timeoutMs;
+    if (commandTimeoutMs is! int || commandTimeoutMs < 1) {
+      _fail('invalid_argument', 'commandTimeoutMs must be positive.');
+    }
+    _commandTimeout = Duration(milliseconds: commandTimeoutMs);
     for (final key in ['live', 'autoPlay', 'looping']) {
       if (config[key] != null && config[key] is! bool) {
         _fail('invalid_argument', '$key must be a boolean.');
@@ -257,7 +264,7 @@ class LumioWebEngine {
   }
 
   Future<void> setFit(String fit) async {
-    await _ready.future.timeout(const Duration(seconds: 25));
+    await _ready.future.timeout(_commandTimeout);
     await command('fit', {'fit': fit});
   }
 
@@ -322,7 +329,7 @@ class LumioWebEngine {
     }
     final id = ++_sequence;
     try {
-      await _request(id, method, args).timeout(const Duration(seconds: 10));
+      await _request(id, method, args).timeout(_commandTimeout);
     } on TimeoutException {
       _pending.remove(id);
       _fail(
@@ -333,12 +340,26 @@ class LumioWebEngine {
     }
   }
 
-  Future<void> _request(
+  Future<Object?> getPosition() async {
+    _checkActive();
+    final id = ++_sequence;
+    try {
+      return await _request(
+        id,
+        'getPosition',
+        const {},
+      ).timeout(_commandTimeout);
+    } finally {
+      _pending.remove(id);
+    }
+  }
+
+  Future<Object?> _request(
     int id,
     String method,
     Map<String, Object?> args,
   ) async {
-    final completer = Completer<void>();
+    final completer = Completer<Object?>();
     _pending[id] = completer;
     // Attach the listener before dispatch: disposal may cancel during dispatch.
     final result = completer.future;
@@ -350,7 +371,7 @@ class LumioWebEngine {
         pending?.completeError(StateError('bridge_dispatch_failed'));
       }),
     );
-    await result;
+    return await result;
   }
 
   Future<void> _send(Map<String, Object?> payload) {

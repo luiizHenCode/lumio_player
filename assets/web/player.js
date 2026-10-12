@@ -12,6 +12,7 @@
   let autoplay = false;
   let requestedFit = 'contain';
   let mediaListeners = [];
+  let lastObservedTime = 0;
   const applyFit = () => {
     video.style.width = '100%';
     video.style.height = '100%';
@@ -33,9 +34,9 @@
   const post = event => {
     if (!disposed) window.LumioBridge.postMessage(JSON.stringify(event));
   };
-  const ack = (request, ok, code, afterDispose = false) => {
+  const ack = (request, ok, code, afterDispose = false, data) => {
     if (request != null && (!disposed || afterDispose)) {
-      window.LumioBridge.postMessage(JSON.stringify({type: 'ack', request, ok, code}));
+      window.LumioBridge.postMessage(JSON.stringify({type: 'ack', request, ok, code, data}));
     }
   };
   const error = (code, message, recoverable, details = {}) => {
@@ -46,7 +47,13 @@
   const state = () => {
     if (disposed) return;
     let bufferedPositionMs = 0;
+        const bufferedRanges = [];
     for (let i = 0; i < video.buffered.length; i++) {
+          const start = video.buffered.start(i);
+          const end = video.buffered.end(i);
+          if (Number.isFinite(start) && Number.isFinite(end) && start >= 0 && end >= start) {
+            bufferedRanges.push({startMs: milliseconds(start), endMs: milliseconds(end)});
+          }
       if (video.buffered.start(i) <= video.currentTime && video.buffered.end(i) >= video.currentTime) {
         bufferedPositionMs = milliseconds(video.buffered.end(i));
       }
@@ -64,7 +71,7 @@
     post({type: 'state', fit: requestedFit, media, initialized, playing: initialized && !video.paused && !video.ended && !buffering,
       buffering, completed: video.ended, positionMs: milliseconds(video.currentTime),
       durationMs: milliseconds(video.duration), width: video.videoWidth || 0, height: video.videoHeight || 0,
-      bufferedPositionMs, live: requestedLive || detectedLive || video.duration === Infinity,
+      bufferedPositionMs, bufferedRanges, live: requestedLive || detectedLive || video.duration === Infinity,
       volume: video.muted ? 0 : video.volume, speed: video.playbackRate});
   };
   const failOpen = code => {
@@ -94,6 +101,7 @@
     buffering = false;
     requestedLive = false;
     detectedLive = false;
+    lastObservedTime = 0;
     bind(video, generation);
   };
   const play = async () => {
@@ -119,8 +127,23 @@
       ack(request, true);
       if (autoplay) void play().catch(() => {});
     });
-    for (const name of ['waiting', 'stalled']) listen(name, () => {
+    listen('waiting', () => {
       buffering = !video.ended;
+      state();
+    });
+    listen('stalled', () => {
+      // Fetching can stall while buffered media continues playing. Unlike
+      // waiting, this event alone is not evidence of a playback interruption.
+      if (video.readyState < 3) buffering = !video.ended;
+      state();
+    });
+    listen('timeupdate', () => {
+      const position = video.currentTime;
+      if (initialized && !video.paused && !video.ended && !video.seeking &&
+          video.readyState >= 3 && position > lastObservedTime) {
+        buffering = false;
+      }
+      lastObservedTime = position;
       state();
     });
     for (const name of ['canplay', 'playing', 'ended']) listen(name, () => {
@@ -216,7 +239,11 @@
     try {
       switch (method) {
         case 'open': open(request, args); return;
-        case 'play': await play(); break;
+        case 'getPosition':
+                  if (!initialized) throw new Error('not_ready');
+                  ack(request, true, undefined, false, milliseconds(video.currentTime));
+                  return;
+                case 'play': await play(); break;
         case 'pause': video.pause(); break;
         case 'seek': video.currentTime = args.positionMs / 1000; break;
         case 'seekToLive': {

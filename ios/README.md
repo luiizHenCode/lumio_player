@@ -13,7 +13,7 @@ All methods other than `create` require an integer `id`:
 
 | Method | Additional arguments | Result |
 | --- | --- | --- |
-| `create` | None | `{id, textureId}` |
+| `create` | Optional `viewType: texture \| platformView` (default `texture`) | `{id, textureId}` for texture; `{id}` for platformView |
 | `open` | `source`, optional `config` | null; readiness/failure is asynchronous |
 | `openPlaylist` | nonempty `sources: [sourceMap, ...]`, required zero-based integer `index`, optional `config` | null; readiness/failure is asynchronous |
 | `selectPlaylistItem` | required zero-based integer `index` | null; selects from the opened playlist and pauses |
@@ -23,7 +23,8 @@ All methods other than `create` require an integer `id`:
 | `volume` | `volume` in 0...1 | null |
 | `speed` | `speed` in 0.01...4 | null |
 | `looping` | Boolean `looping` | null |
-| `diagnostics` | None | Diagnostic map |
+| `getPosition` | None | Nonnegative Int64 milliseconds from `AVQueuePlayer.currentTime()`; zero before opening |
+| `diagnostics` | None | Diagnostic map (includes `viewType`; `textureId` is null in platformView mode) |
 | `dispose` | None | null |
 
 `source` has `type: network | file | asset`, a nonempty `uri`, optional string map
@@ -73,7 +74,7 @@ current queue. Invalid/empty lists and missing, boolean, fractional, or out-of-r
 indices return `invalid_argument`; a bad source leaves the old playlist installed.
 `open` is a one-item playlist and replaces any previous playlist.
 
-The same native `AVQueuePlayer` and Flutter texture are retained across all items.
+The same native `AVQueuePlayer` and selected rendering mode are retained across all items.
 AVPlayerItems from the selected index through the end are actually queued;
 `.actionAtItemEnd = .advance` handles ordinary transitions without Flutter commands.
 Earlier items are not played unless selected or reached by a wrap. `config.looping`
@@ -148,14 +149,19 @@ and disposal handling and preserve the current play/pause intent.
 
 Every event includes `id` and `type`. A `state` includes `initialized`, `playing`,
 `buffering`, `completed`, `positionMs`, `durationMs`, `width`, `height`,
-`bufferedPositionMs`, `live`, `volume`, `speed`, `playlistIndex`, and
+`bufferedPositionMs`, `bufferedRanges`, `live`, `volume`, `speed`, `playlistIndex`, and
 `playlistLength`. Index is zero-based; a newly created empty player reports index
 zero and length zero. Metadata and duration describe only the current item. `speed` is the configured
 playback speed even when paused; `playing` reflects AVPlayer's actual playback
 state. An unknown/indefinite duration is reported as zero. `live` is true when
 requested or when a ready item's duration is indefinite. Buffered position is
 the end of the loaded range containing the current position, rather than the
-furthest disconnected loaded range. Seek waits for readiness, clamps to a
+furthest disconnected loaded range. `bufferedRanges` projects every valid, nonempty,
+finite, nonnegative `loadedTimeRanges` interval as `{startMs: Int64, endMs: Int64}`
+in the item's timeline. Disconnected intervals remain separate and starts are not
+assumed to be zero (including live windows). Invalid intervals are skipped; with no
+current item the field reports `[]`. The legacy `bufferedPositionMs` keeps its current-position fallback
+and 100 ms start tolerance. Seek waits for readiness, clamps to a
 known finite duration, and uses milliseconds in the item's timeline.
 
 States are emitted on relevant native changes and every 500 ms on the main
@@ -167,6 +173,47 @@ error and emit an `error` with `code`, `message`, `details`, and `recoverable`.
 Native item/playback failures are marked nonrecoverable for the current item;
 a new `open` can still replace it. Interrupted/cancelled seeks return method
 errors. Commands on a created player without an item (`play`/`pause`) are no-ops.
+
+### Opt-in native platform view
+
+The raw channel accepts `create({'viewType': 'platformView'})` and returns only
+`{'id': id}`. The default `create()` / `create({'viewType': 'texture'})` still returns
+`{'id': id, 'textureId': textureId}`. Unknown/non-string/null `viewType` values
+return `invalid_argument` before a player is allocated.
+
+The factory is registered as `lumio_player/native_view`. A consuming Dart integration
+can mount it as follows (example only; this change does not modify `lib/`):
+
+```dart
+final created = await const MethodChannel('lumio_player/methods')
+    .invokeMapMethod<String, dynamic>('create', {'viewType': 'platformView'});
+final id = created!['id'] as int;
+final surface = UiKitView(
+  viewType: 'lumio_player/native_view',
+  creationParams: {'id': id},
+  creationParamsCodec: const StandardMessageCodec(),
+);
+final positionMs = await const MethodChannel('lumio_player/methods')
+    .invokeMethod<int>('getPosition', {'id': id});
+```
+
+Supply bounded layout constraints to `surface`. Its `AVPlayerLayer` uses aspect-fit
+and the **same AVQueuePlayer** used by commands, state, playlist, readiness and
+recovery. This mode never registers a texture, creates a video output or starts
+texture-frame polling; the 500 ms state timer remains active. Rendering mode is
+fixed at creation. The unchanged public Dart controller/view still defaults to
+texture; it does not expose this opt-in yet.
+
+A new surface takes ownership and disconnects the previous layer. Only the current
+layer may detach/resume on window lifecycle changes; stale fullscreen/remount
+callbacks and old-view deinit cannot detach or reclaim the new layer. Removing a
+view from its window disconnects rendering, not playback. Releasing a view never
+disposes the player; explicit `dispose({id})` / engine detach disconnects its layer
+and frees the player's observers, timer, items and any texture resources. Invalid,
+unknown, disposed or texture-mode ids mount an inert black native view because
+the factory cannot return a method-channel error.
+
+### Default texture rendering
 
 Video uses `AVPlayerItemVideoOutput` BGRA CVPixelBuffers and a CADisplayLink.
 Flutter's raster-thread `copyPixelBuffer` receives a retained buffer protected
@@ -213,6 +260,7 @@ mkdir -p ios/.native-validation
 xcrun --sdk macosx swiftc -swift-version 5 -warnings-as-errors \
   ios/lumio_player/Sources/lumio_player/LumioConfiguration.swift \
   ios/lumio_player/Sources/lumio_player/LumioLiveSeek.swift \
+  ios/lumio_player/Sources/lumio_player/LumioTimeline.swift \
   ios/Tests/ConfigurationTests.swift -o ios/.native-validation/configuration-tests
 ios/.native-validation/configuration-tests
 ```
@@ -236,6 +284,57 @@ iOS XCTest host or booted simulator in this validation session. The production
 sources also compiled in Swift 5 mode with warnings treated as errors against
 the iOS simulator SDK and cached Flutter.framework. Parser tests executed and passed.
 The Flutter integration suite subsequently passed on the iPhone 17 Pro / iOS 26.5 simulator: native playlist auto-advance, previous/next with pause intent, stable texture ownership, and WebView playlist advance with index retained on native reopening. The standalone XCTest suite remains typechecked only; physical-device, queue wrapping and all failure scenarios are not certified by that integration.
+
+### Validation of platformView / position / buffered ranges (2026-10-12)
+
+Executed on macOS with Xcode's iPhoneSimulator 27.0 SDK and cached Flutter.framework:
+
+- Configuration/parser executable above: **passed**, including rendering-mode
+  defaults/rejections, nonnegative timeline conversion and separate nonzero-start
+  buffer ranges (invalid/empty/indefinite ranges excluded).
+- Live-error parser executable: **passed** (existing recovery regression coverage).
+- All production Swift sources: **compiled and linked**, Swift 5, iOS 13 simulator
+  deployment target, warnings treated as errors.
+- `NativePlaylistTests`, `NativePlayerViewTests`, `AudioPolicyTests`: **typechecked**
+  only. Added coverage for shared queue/layer ownership, old-view callbacks/deinit,
+  window detach/reattach, player disposal, zero texture resources, factory codec,
+  inert invalid ids, readiness, seek and position. No XCTest execution is claimed.
+
+Reproducible compilation/typecheck from the package root in this environment
+(adjust the SDK/cache paths for another machine):
+
+```sh
+SDKROOT=/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator27.0.sdk \
+xcrun swiftc -swift-version 5 -warnings-as-errors \
+  -sdk /Applications/Xcode.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator27.0.sdk \
+  -target arm64-apple-ios13.0-simulator \
+  -F /opt/homebrew/share/flutter/bin/cache/artifacts/engine/ios/Flutter.xcframework/ios-arm64_x86_64-simulator \
+  -framework Flutter -emit-library -module-name lumio_player \
+  ios/lumio_player/Sources/lumio_player/*.swift \
+  -o ios/.native-validation/liblumio_player.dylib
+
+xcrun swiftc -swift-version 5 -warnings-as-errors \
+  -sdk /Applications/Xcode.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator27.0.sdk \
+  -target arm64-apple-ios13.0-simulator \
+  -F /opt/homebrew/share/flutter/bin/cache/artifacts/engine/ios/Flutter.xcframework/ios-arm64_x86_64-simulator \
+  -F /Applications/Xcode.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/Library/Frameworks \
+  -I /Applications/Xcode.app/Contents/Developer/Platforms/iPhoneSimulator.platform/Developer/usr/lib \
+  -typecheck ios/lumio_player/Sources/lumio_player/*.swift \
+  ios/Tests/NativePlaylistTests.swift ios/Tests/NativePlayerViewTests.swift \
+  ios/Tests/AudioPolicyTests.swift
+
+xcrun --sdk macosx swiftc -swift-version 5 -warnings-as-errors \
+  ios/lumio_player/Sources/lumio_player/LumioLiveError.swift \
+  ios/Tests/LiveErrorTests.swift -o ios/.native-validation/live-error-tests
+ios/.native-validation/live-error-tests
+```
+
+The first XCTest typecheck attempt lacked the XCTest framework search path and
+failed with `no such module 'XCTest'`; the complete command above passed. There
+was no booted simulator or configured standalone XCTest host. New platform-view
+rendering, fullscreen transitions, HLS loaded ranges, background rendering and
+physical-device playback still require runtime validation. The historical
+integration results above do **not** certify this opt-in rendering mode.
 
 Additional runtime coverage should include live HLS `seekToLive`, seek
 supersession/disposal, VOD rejection, loop/end events, buffering/failures, audio

@@ -10,7 +10,7 @@ import 'player_view_test.dart' show TestController, close, host;
 const _seekKey = ValueKey('lumio-seek-feedback');
 const _holdKey = ValueKey('lumio-hold-speed-feedback');
 const _holdLabelKey = ValueKey('lumio-hold-speed-label');
-const _ready = LumioPlayerState(
+final _ready = LumioPlayerState(
   initialized: true,
   duration: Duration(minutes: 1),
   position: Duration(seconds: 30),

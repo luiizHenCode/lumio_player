@@ -17,7 +17,7 @@ void main() {
             LumioPlaylistItem(source: first),
             LumioPlaylistItem(source: second),
           ])
-          ..value = const LumioPlayerState(
+          ..value = LumioPlayerState(
             initialized: true,
             playing: true,
             duration: Duration(seconds: 10),
@@ -81,7 +81,7 @@ void main() {
         LumioPlaylistItem(source: LumioSource.asset('first.mp4')),
         LumioPlaylistItem(source: LumioSource.asset('second.mp4')),
       ])
-      ..value = const LumioPlayerState(initialized: true, playing: true);
+      ..value = LumioPlayerState(initialized: true, playing: true);
     await tester.pumpWidget(
       host(
         controller,

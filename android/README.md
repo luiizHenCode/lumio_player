@@ -1,7 +1,7 @@
 # Android backend
 
-Uses AndroidX Media3 ExoPlayer 1.9.2 directly, with one Flutter `SurfaceProducer`
-texture per player. No `video_player` dependency. Requires Android API 24+ and a
+Uses AndroidX Media3 ExoPlayer 1.9.2 directly, with either one Flutter
+`SurfaceProducer` texture (default) or a native `SurfaceView` per player. No `video_player` dependency. Requires Android API 24+ and a
 Flutter embedding exposing `SurfaceProducer.onSurfaceAvailable/onSurfaceCleanup`.
 
 ## Channels
@@ -9,7 +9,24 @@ Flutter embedding exposing `SurfaceProducer.onSurfaceAvailable/onSurfaceCleanup`
 - MethodChannel: `lumio_player/methods`
 - EventChannel: `lumio_player/events` (one shared stream, routed by player `id`)
 
-`create` returns `{id, textureId}`. `open`, `openPlaylist`, `selectPlaylistItem`,
+`create` accepts optional `{viewType: 'texture' | 'platformView'}`. Omitting the
+key defaults to `texture`; explicit null, wrong types, and other values return
+`invalid_argument` before allocating a player/producer. Texture mode returns
+`{id, textureId}`; platformView mode returns `{id}` and allocates no texture
+producer. The rendering mode is fixed for the instance.
+
+For platformView mode, Dart mounts `AndroidView(viewType:
+'lumio_player/native_view', creationParams: {'id': id}, creationParamsCodec:
+StandardMessageCodec())`. The registered factory validates the ID and rendering
+mode. It binds a `SurfaceView` to the instance's existing ExoPlayer, never a
+second playback engine. ExoPlayer manages SurfaceHolder creation/destruction;
+the holder owns its Surface (the plugin must not release it).
+
+`getPosition` accepts `{id}` and returns an integer position in milliseconds
+from the current ExoPlayer, clamped to zero, or zero before a source is opened.
+Unknown/disposed IDs and malformed IDs return `invalid_argument`.
+
+`open`, `openPlaylist`, `selectPlaylistItem`,
 `play`, `pause`, `seek`, `seekToLive`,
 `volume`, `speed`, `looping`, and `dispose` accept an `id`. Mutating methods return null.
 `seekToLive` accepts `{id}` and calls `seekToDefaultPosition()` only when Media3
@@ -86,7 +103,7 @@ Minimum buffering must be at least both playback thresholds; maximum buffering
 must be at least minimum buffering. `live` reports caller intent but does not
 force live behavior on VOD or change these defaults. Reopening resets playback
 and replaces the ExoPlayer to apply buffer configuration, retaining the texture
-ID. Configuration is validated before replacing the existing source.
+ID or rebinding the currently attached native view to the replacement player. Configuration is validated before replacing the existing source.
 When supplied, `liveTargetOffsetMs` sets the MediaItem live target offset; actual
 live positioning remains subject to the source timeline and Media3 behavior.
 `enableDecoderFallback` lets Media3 try lower-priority decoders if the preferred
@@ -95,6 +112,7 @@ from every decoder failure.
 
 State events contain `id`, `type: state`, `initialized`, `playing`, `buffering`,
 `completed`, `positionMs`, `durationMs`, `width`, `height`, `bufferedPositionMs`,
+`bufferedRanges`,
 `live`, `volume`, `speed`, `playlistIndex` (Media3 `currentMediaItemIndex`), and
 `playlistLength` (Media3 `mediaItemCount`). An ordinary `open` reports index 0 and
 length 1; before any open, length is 0. An unknown duration is reported as 0; an unknown
@@ -105,6 +123,15 @@ Seamless transitions already in READY initialize the new item in the same event
 batch. Position/duration snapshots are emitted after native transitions, with periodic
 updates every 500 ms while instances exist. A new event subscription gets a
 snapshot of all instances, plus their latest errors.
+
+`bufferedRanges` is a list of `{startMs, endMs}` integer-millisecond maps. Media3
+exposes only the current item's forward-buffer endpoint, not arbitrary cached
+or disconnected ranges. We report at most one known interval, **currentPosition
+through bufferedPosition**, only when a source exists and the endpoint is greater
+than a valid non-negative current position. Otherwise the list is empty. We do
+not assume buffering starts at zero, retain previous ranges after seeks/item
+transitions, or reconstruct invisible ranges. `bufferedPositionMs` remains
+unchanged for legacy clients. Live positions use Media3's current-window coordinates.
 
 Playback errors contain `id`, `type: error`, `code`, `message`, `details`, and
 `recoverable`, `playlistIndex`, and `playlistLength`. Playback error indexes are
@@ -130,6 +157,20 @@ backend clears ExoPlayer's surface on cleanup and binds the new surface on
 availability. Flutter owns the Surface; the plugin releases the producer, not
 the Surface. Engine detachment stops updates and releases all instances.
 
+For native views, Flutter detach clears only the video output; reattach restores
+it if that view still owns the instance. Disposing a PlatformView never disposes,
+pauses, or resets the player. The most recently created view owns the output;
+late detach/dispose/reattach from superseded views cannot disconnect or reclaim
+the new output. Fullscreen remounts must use the same player ID. Once a new view
+has superseded an old view, returning inline requires mounting another view
+with that ID (the old view cannot reclaim ownership). `open`/`openPlaylist`
+rebind the owner to their replacement ExoPlayer, while playlist selections keep
+the existing player and output. Method `dispose` invalidates view ownership,
+clears output, releases the player and any texture producer. Late view callbacks
+then do nothing. Diagnostics include `viewType`; `textureId` and
+`handlesCropAndRotation` are null in native-view mode. Native `surfaceAvailable`
+means the view is attached, not proof that its holder currently has a Surface.
+
 ## Native validation
 
 The example now registers the plugin through Flutter's plugin metadata, and a
@@ -143,6 +184,11 @@ From `example/android/`:
 For standalone validation, the init script supplies the installed Flutter
 embedding as compile-only/test dependencies without changing Dart or example
 sources. `android/local.properties` must contain `sdk.dir` and `flutter.sdk`.
+
+Use JDK 17 for both the Gradle launcher and daemon. A newer default JDK can
+cause Mockito 5.0.0/Byte Buddy instrumentation failures; select JDK 17 using
+`JAVA_HOME` and, if necessary, Gradle's `-Dorg.gradle.java.home` option rather
+than changing plugin dependencies.
 
 Standalone, from `android/`:
 
@@ -160,6 +206,8 @@ not yet generated Flutter plugin metadata. From `example/android/`:
 Unit tests cover configuration/argument validation, queue parsing/index bounds,
 repeat precedence, Media3 queue loading, selection play-intent preservation
 (including completed/paused/error-idle states), live-seek gating, and
-detached-engine behavior.
+detached-engine behavior. Additional Mockito tests cover create-mode parsing,
+position/range guards, native output ownership across fullscreen replacement,
+Flutter detach/remount, player replacement, and late callbacks after disposal.
 Actual decoding, network playback, texture rendering, and surface recreation
 require device/emulator integration testing.

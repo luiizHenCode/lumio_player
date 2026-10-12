@@ -48,6 +48,16 @@ O watchdog usa posição. Se frames congelam mas o relógio avança, ele pode n�
 
 O caminho iOS usa `AVURLAssetHTTPHeaderFieldsKey` como string de options, sem contrato público documentado da Apple. Não registrar como suporte universal de autenticação HLS antes dessas verificações.
 
+## Buffer, posição sob demanda e Platform View
+
+- [ ] Em VOD iOS/WebView, fazer seeks distantes e verificar intervalos separados: a barra não deve pintar os gaps como bufferizados. Android deve mostrar apenas o trecho conhecido pelo Media3, sem presumir início zero.
+- [ ] Consultar `getPosition()` após seek, play e pause; comparar com o quadro/timeline sem exigir precisão frame a frame.
+- [ ] Trocar fonte/item/engine ou descartar durante uma consulta: o resultado antigo não deve atualizar a nova sessão.
+- [ ] Repetir reprodução com `nativeViewType: texture` e `platformView` no mesmo dispositivo/stream. Comparar vídeo preto, rotação, enquadramento, FPS, CPU/memória sem pressupor superioridade de um modo.
+- [ ] Platform View: testar todos os fits, clipping, zoom/pan, gestos, overlays e fullscreen ida/volta repetidamente; somente uma superfície deve controlar o player.
+- [ ] Testar montagem tardia, desmontagem durante loading, remount, fallback WebView e retorno ao nativo, sem áudio/fonte duplicados.
+- [ ] Confirmar que a captura por RepaintBoundary fica indisponível para Platform View e que o host informa isso, sem exportar imagem preta.
+
 ## Recursos e desempenho
 
 - [ ] Fazer 30 ciclos abrir/fechar, incluindo sair durante loading, erro e recuperação.

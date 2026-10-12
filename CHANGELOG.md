@@ -1,6 +1,21 @@
 # Changelog
 
+## Próxima versão — timeouts independentes
+
+- `LumioPlayerConfiguration.commandTimeout` opcional: getter efetivo usa `initializationTimeout` quando omitido, preservando construtores existentes. Comandos e consultas usam o limite separado no Dart/WebView, sem reduzir o orçamento de create/open/readiness/playlist nem alterar fallback/recovery.
+- Relatórios técnicos incluem `initializationTimeoutMs` e `commandTimeoutMs` com allowlist numérica; ambos os limites exigem duração positiva.
+
+## Próxima versão — buffer, posição e superfície nativa
+
+- `LumioPlayerState.buffered` / `LumioBufferedRange`: intervalos reais no iOS e WebView, trecho conhecido de buffer no Media3; controles preservam gaps e o campo legacy continua disponível.
+- `getPosition()`: consulta sob demanda do backend ativo, serializada e protegida contra resultados de fontes/engines/itens antigos.
+- `LumioNativeViewType.platformView`: opção de `SurfaceView` Android e `AVPlayerLayer` iOS, sem textura, com ownership protegido no remount/fullscreen. Textura permanece o padrão.
+- Capacidades de superfície/captura explícitas; Platform Views não são capturáveis por `RepaintBoundary`.
+- Mudança de API: o construtor de `LumioPlayerState` não é mais `const`, para copiar defensivamente os intervalos de buffer. Requer atualização conjunta de Dart, assets e backends nativos e rebuild completo do consumidor.
+
 ## Próxima versão — estabilidade e experiência de reprodução
+
+- WebView diferencia `stalled` (download temporariamente parado) de `waiting` (reprodução sem dados); progresso de playback com dados suficientes limpa buffering obsoleto. Testes cobrem vídeo sem áudio e preservação do loading quando há espera real.
 
 - API pública `failureReport()` / `LumioFailureReport`: texto formatado e metadata profundamente imutável, allowlists para detalhes/diagnósticos, timestamp da última falha preservado em recovery/retry/dispose e captura nativa limitada antes do release quando possível.
 - Relatório preserva HTTP status Android extraído de exceção tipada por cadeia cycle-safe, códigos numéricos iOS/Media3 e plataforma/SDK/versão de SO com formato restrito, sem nomes/modelos identificáveis. Testes cobrem falhas iniciais antes do dispose e isolamento da engine capturada.

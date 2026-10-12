@@ -4,6 +4,9 @@ enum LumioPlaybackEngine { automatic, native, webview }
 
 enum LumioPlaybackMode { video, audio, live }
 
+/// Texture supports Flutter surface capture; platform views do not.
+enum LumioNativeViewType { texture, platformView }
+
 /// Native audio policy. Explicit policies affect the shared iOS audio session.
 enum LumioAudioPolicy {
   /// Leave the host audio session unchanged and do not request Android focus.
@@ -126,6 +129,7 @@ class LumioBufferConfiguration {
 class LumioPlayerConfiguration {
   const LumioPlayerConfiguration({
     this.engine = LumioPlaybackEngine.automatic,
+    this.nativeViewType = LumioNativeViewType.texture,
     this.mode = LumioPlaybackMode.video,
     this.audioPolicy = LumioAudioPolicy.preserveHost,
     this.allowBackgroundPlayback = false,
@@ -134,12 +138,16 @@ class LumioPlayerConfiguration {
     this.volume = 1,
     this.speed = 1,
     this.initializationTimeout = const Duration(seconds: 25),
+    Duration? commandTimeout,
     this.buffer = const LumioBufferConfiguration(),
     this.allowAutomaticFallback = true,
     this.enableDecoderFallback = true,
     this.liveTargetOffset,
-  });
+    // Keep the public named parameter while storing its nullable override privately.
+    // ignore: prefer_initializing_formals
+  }) : _commandTimeout = commandTimeout;
   final LumioPlaybackEngine engine;
+  final LumioNativeViewType nativeViewType;
   final LumioPlaybackMode mode;
   final LumioAudioPolicy audioPolicy;
 
@@ -148,7 +156,14 @@ class LumioPlayerConfiguration {
   final bool allowBackgroundPlayback;
   final bool autoPlay, looping, allowAutomaticFallback;
   final double volume, speed;
+
+  /// Budget for create/open, readiness and playlist startup.
   final Duration initializationTimeout;
+  final Duration? _commandTimeout;
+
+  /// Deadline for commands and backend queries. When omitted, follows
+  /// [initializationTimeout] for backwards compatibility.
+  Duration get commandTimeout => _commandTimeout ?? initializationTimeout;
   final LumioBufferConfiguration buffer;
 
   /// Android Media3 options. iOS reports them as unsupported in diagnostics.
@@ -168,8 +183,9 @@ class LumioPlayerConfiguration {
         volume > 1 ||
         !speed.isFinite ||
         speed <= 0 ||
-        initializationTimeout <= Duration.zero) {
-      throw ArgumentError('Invalid volume, speed or initialization timeout.');
+        initializationTimeout <= Duration.zero ||
+        commandTimeout <= Duration.zero) {
+      throw ArgumentError('Invalid volume, speed or timeout.');
     }
   }
 
@@ -182,6 +198,7 @@ class LumioPlayerConfiguration {
     'volume': volume,
     'speed': speed,
     'initializationTimeoutMs': initializationTimeout.inMilliseconds,
+    'commandTimeoutMs': commandTimeout.inMilliseconds,
     'enableDecoderFallback': enableDecoderFallback,
     if (liveTargetOffset != null)
       'liveTargetOffsetMs': liveTargetOffset!.inMilliseconds,
@@ -227,10 +244,47 @@ class LumioLogEntry {
 
 typedef LumioLogger = void Function(LumioLogEntry entry);
 
+/// A known buffered interval; no continuity outside this interval is implied.
+@immutable
+class LumioBufferedRange {
+  LumioBufferedRange({required this.start, required this.end}) {
+    if (start.isNegative || end < start) {
+      throw ArgumentError('Buffered ranges require 0 <= start <= end.');
+    }
+  }
+
+  final Duration start, end;
+
+  @override
+  bool operator ==(Object other) =>
+      other is LumioBufferedRange && other.start == start && other.end == end;
+
+  @override
+  int get hashCode => Object.hash(start, end);
+
+  static List<LumioBufferedRange> parse(Object? value) {
+    if (value is! List) return const [];
+    return [
+      for (final range in value)
+        if (range is Map &&
+            range['startMs'] is num &&
+            range['endMs'] is num &&
+            (range['startMs'] as num).isFinite &&
+            (range['endMs'] as num).isFinite &&
+            (range['startMs'] as num) >= 0 &&
+            (range['endMs'] as num) >= (range['startMs'] as num))
+          LumioBufferedRange(
+            start: Duration(milliseconds: (range['startMs'] as num).toInt()),
+            end: Duration(milliseconds: (range['endMs'] as num).toInt()),
+          ),
+    ];
+  }
+}
+
 /// State is owned by the controller. No native/plugin types leak into this API.
 @immutable
 class LumioPlayerState {
-  const LumioPlayerState({
+  LumioPlayerState({
     this.initialized = false,
     this.playing = false,
     this.buffering = false,
@@ -240,6 +294,7 @@ class LumioPlayerState {
     this.position = Duration.zero,
     this.duration = Duration.zero,
     this.bufferedPosition = Duration.zero,
+    List<LumioBufferedRange> buffered = const [],
     this.size = Size.zero,
     this.volume = 1,
     this.speed = 1,
@@ -247,10 +302,15 @@ class LumioPlayerState {
     this.playlistIndex = 0,
     this.playlistLength = 0,
     this.error,
-  });
+  }) : buffered = List.unmodifiable(buffered);
   final bool initialized, playing, buffering, completed, transitioning, live;
   final int playlistIndex, playlistLength;
   final Duration position, duration, bufferedPosition;
+
+  /// Known buffered intervals only. Android may report just the interval from
+  /// the current position to its buffered position; iOS/WebView report all
+  /// available intervals. An empty list does not imply a legacy continuous range.
+  final List<LumioBufferedRange> buffered;
   final Size size;
   final double volume, speed;
   final LumioPlaybackEngine engine;
@@ -267,6 +327,7 @@ class LumioPlayerState {
     Duration? position,
     Duration? duration,
     Duration? bufferedPosition,
+    List<LumioBufferedRange>? buffered,
     Size? size,
     double? volume,
     double? speed,
@@ -285,6 +346,7 @@ class LumioPlayerState {
     position: position ?? this.position,
     duration: duration ?? this.duration,
     bufferedPosition: bufferedPosition ?? this.bufferedPosition,
+    buffered: buffered ?? this.buffered,
     size: size ?? this.size,
     volume: volume ?? this.volume,
     speed: speed ?? this.speed,
@@ -297,6 +359,9 @@ class LumioPlayerState {
     double number(String key, double fallback) =>
         (event[key] as num?)?.toDouble() ?? fallback;
     return copyWith(
+      buffered: event.containsKey('bufferedRanges')
+          ? LumioBufferedRange.parse(event['bufferedRanges'])
+          : null,
       initialized: event['initialized'] as bool?,
       playing: event['playing'] as bool?,
       buffering: event['buffering'] as bool?,
@@ -340,12 +405,21 @@ class LumioCapabilities {
     required this.detailedBufferControl,
     this.volumeControl = true,
     this.nativePlaylist = true,
+    this.nativePlatformView = false,
+    this.supportsSurfaceCapture = false,
   });
   final LumioPlaybackEngine engine;
 
   /// False for iOS WebView: only mute/unmute is available, not fractional gain.
   final bool volumeControl;
   final bool nativePlaylist;
+
+  /// Native platform-view rendering is available on this engine/platform.
+  final bool nativePlatformView;
+
+  /// Whether the selected surface can be captured by a RepaintBoundary.
+  /// WebViews and native platform views cannot be captured this way.
+  final bool supportsSurfaceCapture;
   final bool network, localFiles, assets, httpHeaders, detailedBufferControl;
   final Set<LumioMediaFormat> formats;
 }

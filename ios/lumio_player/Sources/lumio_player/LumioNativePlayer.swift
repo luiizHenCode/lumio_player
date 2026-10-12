@@ -21,6 +21,31 @@ final class LumioNativePlayer: NSObject, FlutterTexture {
   private let registry: FlutterTextureRegistry
   private let emit: ([String: Any]) -> Void
   private let player = AVQueuePlayer()
+  let viewType: LumioViewType
+  private weak var attachedLayer: AVPlayerLayer?
+
+  func attachLayer(_ layer: AVPlayerLayer) {
+    guard !disposed, viewType == .platformView else { return }
+    attachedLayer?.player = nil
+    attachedLayer = layer
+    layer.player = player
+  }
+
+  func setLayerVisible(_ layer: AVPlayerLayer, visible: Bool) {
+    guard !disposed, attachedLayer === layer else { return }
+    layer.player = visible ? player : nil
+  }
+
+  func detachLayer(_ layer: AVPlayerLayer) {
+    guard attachedLayer === layer else { return }
+    layer.player = nil
+    attachedLayer = nil
+  }
+
+  func getPosition() -> Int64 {
+    guard !disposed, player.currentItem != nil else { return 0 }
+    return lumioMilliseconds(player.currentTime())
+  }
   private var currentItemObservation: NSKeyValueObservation?
   private var rebuildingQueue = false
   private var playlistSources: [LumioAssetSource] = []
@@ -53,12 +78,14 @@ final class LumioNativePlayer: NSObject, FlutterTexture {
   private var liveErrorHistory = LumioLiveErrorHistory()
   private var liveTimeline = LumioLiveTimeline()
 
-  init(id: Int64, registry: FlutterTextureRegistry, emit: @escaping ([String: Any]) -> Void) {
+  init(id: Int64, registry: FlutterTextureRegistry, viewType: LumioViewType = .texture,
+       emit: @escaping ([String: Any]) -> Void) {
     self.id = id
     self.registry = registry
+    self.viewType = viewType
     self.emit = emit
     super.init()
-    textureID = registry.register(self)
+    if viewType == .texture { textureID = registry.register(self) }
     displayTarget.owner = self
     player.actionAtItemEnd = .pause
     currentItemObservation = player.observe(\.currentItem, options: [.new]) { [weak self] player, _ in
@@ -142,13 +169,15 @@ final class LumioNativePlayer: NSObject, FlutterTexture {
     playlistIndex = index
     // Keep the last item installed so completion, final position and replay work.
     player.actionAtItemEnd = configuration.looping || index == playlistSources.count - 1 ? .pause : .advance
-    let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
-      kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-      kCVPixelBufferIOSurfacePropertiesKey as String: [String: String]()
-    ])
-    item.add(output)
     self.item = item
-    self.output = output
+    if viewType == .texture {
+      let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
+        kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+        kCVPixelBufferIOSurfacePropertiesKey as String: [String: String]()
+      ])
+      item.add(output)
+      self.output = output
+    }
 
     let currentGeneration = generation
     let changed: (@escaping (LumioNativePlayer) -> Void) -> Void = { [weak self, weak item] action in
@@ -366,6 +395,7 @@ final class LumioNativePlayer: NSObject, FlutterTexture {
   }
 
   private func updateDisplayLink() {
+    guard !disposed, viewType == .texture else { return }
     let hasVideo = (item?.presentationSize.width ?? 0) > 0 && (item?.presentationSize.height ?? 0) > 0
     if hasVideo && displayLink == nil {
       let link = CADisplayLink(target: displayTarget, selector: #selector(LumioDisplayTarget.tick(_:)))
@@ -402,13 +432,13 @@ final class LumioNativePlayer: NSObject, FlutterTexture {
       bindCurrentItem(player.currentItem)
       return
     }
-    let position = milliseconds(player.currentTime())
+    let position = getPosition()
     let duration = item.map { milliseconds($0.duration) } ?? 0
+    let bufferedRanges = lumioBufferedRanges(item?.loadedTimeRanges.map { $0.timeRangeValue } ?? [])
     var buffered = position
-    for range in item?.loadedTimeRanges ?? [] {
-      let timeRange = range.timeRangeValue
-      let start = milliseconds(timeRange.start)
-      let end = milliseconds(CMTimeRangeGetEnd(timeRange))
+    for range in bufferedRanges {
+      let start = range["startMs"]!
+      let end = range["endMs"]!
       if start <= position + 100 && end >= position { buffered = max(buffered, end) }
     }
     let size = item?.presentationSize ?? .zero
@@ -430,7 +460,7 @@ final class LumioNativePlayer: NSObject, FlutterTexture {
       "playing": player.timeControlStatus == .playing, "buffering": buffering,
       "completed": completed, "positionMs": position, "durationMs": duration,
       "width": dimension(size.width), "height": dimension(size.height),
-      "bufferedPositionMs": buffered,
+      "bufferedPositionMs": buffered, "bufferedRanges": bufferedRanges,
       "live": configuration.live || (initialized && item?.duration.isIndefinite == true),
       "volume": configuration.volume, "speed": configuration.speed,
       "playlistIndex": playlistIndex, "playlistLength": playlistLength
@@ -438,9 +468,7 @@ final class LumioNativePlayer: NSObject, FlutterTexture {
   }
 
   private func milliseconds(_ time: CMTime) -> Int64 {
-    let value = CMTimeGetSeconds(time) * 1000
-    guard value.isFinite, value > 0 else { return 0 }
-    return Int64(min(value, Double(Int64.max / 2)))
+    lumioMilliseconds(time)
   }
 
   private func dimension(_ value: CGFloat) -> Int {
@@ -542,7 +570,8 @@ final class LumioNativePlayer: NSObject, FlutterTexture {
     loadMediaStatistics()
     let session = AVAudioSession.sharedInstance()
     return [
-      "id": id, "backend": "AVQueuePlayer", "textureId": textureID,
+      "id": id, "backend": "AVQueuePlayer", "textureId": viewType == .texture ? textureID as Any : NSNull(),
+      "viewType": viewType.rawValue,
       "device": ["platform": "iOS", "model": UIDevice.current.model, "systemVersion": UIDevice.current.systemVersion],
       "media": mediaStatistics,
       "decoderName": NSNull(), // AVPlayer does not expose the selected decoder.
@@ -599,6 +628,8 @@ final class LumioNativePlayer: NSObject, FlutterTexture {
   func dispose() {
     guard !disposed else { return }
     disposed = true
+    attachedLayer?.player = nil
+    attachedLayer = nil
     wantsPlayback = false
     resumeAfterInterruption = false
     currentItemObservation?.invalidate()
@@ -618,6 +649,6 @@ final class LumioNativePlayer: NSObject, FlutterTexture {
     lifecycleNotifications.forEach { NotificationCenter.default.removeObserver($0) }
     lifecycleNotifications.removeAll()
     displayTarget.owner = nil
-    registry.unregisterTexture(textureID)
+    if viewType == .texture { registry.unregisterTexture(textureID) }
   }
 }

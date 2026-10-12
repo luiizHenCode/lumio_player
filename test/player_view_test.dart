@@ -178,7 +178,7 @@ void main() {
       tester,
     ) async {
       final controller = TestController()
-        ..value = const LumioPlayerState(
+        ..value = LumioPlayerState(
           initialized: true,
           playing: true,
           duration: Duration(seconds: 100),
@@ -222,7 +222,7 @@ void main() {
       'surfaceCaptureKey excludes $placement controls and survives fullscreen',
       (tester) async {
         final controller = TestController()
-          ..value = const LumioPlayerState(initialized: true);
+          ..value = LumioPlayerState(initialized: true);
         final captureKey = GlobalKey();
         await tester.pumpWidget(
           host(
@@ -284,7 +284,7 @@ void main() {
         '$layout uses reduced horizontal padding and labels at $width',
         (tester) async {
           final controller = TestController()
-            ..value = const LumioPlayerState(
+            ..value = LumioPlayerState(
               initialized: true,
               playing: true,
               duration: Duration(minutes: 5),
@@ -324,7 +324,7 @@ void main() {
       '$layout cycles speed and long press resets without advancing',
       (tester) async {
         final controller = TestController()
-          ..value = const LumioPlayerState(initialized: true);
+          ..value = LumioPlayerState(initialized: true);
         await tester.pumpWidget(
           host(
             controller,
@@ -372,7 +372,7 @@ void main() {
       '$layout cycles fractional custom speeds and resets outside list',
       (tester) async {
         final controller = TestController()
-          ..value = const LumioPlayerState(initialized: true);
+          ..value = LumioPlayerState(initialized: true);
         await tester.pumpWidget(
           host(
             controller,
@@ -409,13 +409,9 @@ void main() {
     ) async {
       final controller = TestController();
       for (final state in [
-        const LumioPlayerState(speed: 3),
-        const LumioPlayerState(
-          initialized: true,
-          transitioning: true,
-          speed: 3,
-        ),
-        const LumioPlayerState(
+        LumioPlayerState(speed: 3),
+        LumioPlayerState(initialized: true, transitioning: true, speed: 3),
+        LumioPlayerState(
           initialized: true,
           speed: 3,
           error: LumioPlayerError(code: 'test', message: 'Failure'),
@@ -448,7 +444,7 @@ void main() {
       tester,
     ) async {
       final controller = TestController()
-        ..value = const LumioPlayerState(
+        ..value = LumioPlayerState(
           initialized: true,
           playing: true,
           duration: Duration(minutes: 2),
@@ -491,7 +487,7 @@ void main() {
 
     testWidgets('$layout uses custom plain status labels', (tester) async {
       final controller = TestController()
-        ..value = const LumioPlayerState(
+        ..value = LumioPlayerState(
           initialized: true,
           duration: Duration(minutes: 2),
         );
@@ -531,7 +527,7 @@ void main() {
     'custom live label also supplies opt-in time and stays informational',
     (tester) async {
       final controller = TestController()
-        ..value = const LumioPlayerState(
+        ..value = LumioPlayerState(
           initialized: true,
           live: true,
           position: Duration(seconds: 38),
@@ -674,7 +670,7 @@ void main() {
               ),
             ),
         ])
-        ..value = const LumioPlayerState(
+        ..value = LumioPlayerState(
           initialized: true,
           duration: Duration(minutes: 2),
           speed: 4,
@@ -725,7 +721,7 @@ void main() {
         '$placement preserves background RGB and scales only overlay alpha for $color',
         (tester) async {
           final controller = TestController()
-            ..value = const LumioPlayerState(initialized: true, playing: true);
+            ..value = LumioPlayerState(initialized: true, playing: true);
           await tester.pumpWidget(
             host(
               controller,
@@ -762,7 +758,7 @@ void main() {
         '$placement controls preserve $videoLayout viewport geometry',
         (tester) async {
           final controller = TestController()
-            ..value = const LumioPlayerState(
+            ..value = LumioPlayerState(
               initialized: true,
               duration: Duration(minutes: 2),
             );
@@ -828,7 +824,7 @@ void main() {
       '$placement control hit tests never trigger media seek or hold',
       (tester) async {
         final controller = TestController()
-          ..value = const LumioPlayerState(
+          ..value = LumioPlayerState(
             initialized: true,
             duration: Duration(minutes: 2),
           );
@@ -864,7 +860,7 @@ void main() {
       tester,
     ) async {
       final controller = TestController()
-        ..value = const LumioPlayerState(
+        ..value = LumioPlayerState(
           initialized: true,
           playing: true,
           duration: Duration(minutes: 2),
@@ -963,7 +959,7 @@ void main() {
         tester,
       ) async {
         final controller = TestController()
-          ..value = const LumioPlayerState(
+          ..value = LumioPlayerState(
             initialized: true,
             position: Duration(seconds: 4),
             duration: Duration(seconds: 77),
@@ -1076,7 +1072,7 @@ void main() {
         tester,
       ) async {
         final controller = TestController()
-          ..value = const LumioPlayerState(
+          ..value = LumioPlayerState(
             initialized: true,
             duration: Duration(minutes: 1),
           );
@@ -1253,7 +1249,7 @@ void main() {
         'simplified $action has one trailing action and central progress at ${width}px',
         (tester) async {
           final controller = TestController()
-            ..value = const LumioPlayerState(
+            ..value = LumioPlayerState(
               initialized: true,
               position: Duration(seconds: 4),
               duration: Duration(seconds: 77),
@@ -1357,7 +1353,7 @@ void main() {
     'live status is bold informational text without playback controls',
     (tester) async {
       final controller = TestController()
-        ..value = const LumioPlayerState(initialized: true, live: true);
+        ..value = LumioPlayerState(initialized: true, live: true);
       await tester.pumpWidget(host(controller, title: 'Live title'));
       expect(find.text('Live title'), findsOneWidget);
       expect(find.text('AO VIVO'), findsOneWidget);
@@ -1459,7 +1455,7 @@ void main() {
     tester,
   ) async {
     final controller = TestController()
-      ..value = const LumioPlayerState(initialized: true);
+      ..value = LumioPlayerState(initialized: true);
     await tester.pumpWidget(
       host(
         controller,
@@ -1479,7 +1475,7 @@ void main() {
     tester,
   ) async {
     final controller = TestController()
-      ..value = const LumioPlayerState(initialized: true);
+      ..value = LumioPlayerState(initialized: true);
     var toggles = 0;
     Widget standalone({
       VoidCallback? callback,
@@ -1524,7 +1520,7 @@ void main() {
     tester,
   ) async {
     final controller = TestController()
-      ..value = const LumioPlayerState(initialized: true);
+      ..value = LumioPlayerState(initialized: true);
     var toggles = 0;
     await tester.pumpWidget(
       host(controller, onToggleFullscreen: () => toggles++),
@@ -1548,7 +1544,7 @@ void main() {
     'built-in fullscreen route keeps a single surface and returns inline',
     (tester) async {
       final controller = TestController()
-        ..value = const LumioPlayerState(
+        ..value = LumioPlayerState(
           initialized: true,
           position: Duration(seconds: 12),
           duration: Duration(minutes: 2),
@@ -1620,7 +1616,7 @@ void main() {
           '$layout/$action fits ${width}px with title and secondary controls',
           (tester) async {
             final controller = TestController()
-              ..value = const LumioPlayerState(
+              ..value = LumioPlayerState(
                 initialized: true,
                 duration: Duration(minutes: 2),
                 error: LumioPlayerError(code: 'test', message: 'Failure'),
@@ -1662,7 +1658,7 @@ void main() {
     tester,
   ) async {
     final controller = TestController()
-      ..value = const LumioPlayerState(
+      ..value = LumioPlayerState(
         initialized: true,
         position: Duration(seconds: 4),
         duration: Duration(seconds: 77),
@@ -1708,7 +1704,7 @@ void main() {
 
   testWidgets('progress fills the row when time is hidden', (tester) async {
     final controller = TestController()
-      ..value = const LumioPlayerState(
+      ..value = LumioPlayerState(
         initialized: true,
         duration: Duration(minutes: 2),
       );
@@ -1733,7 +1729,7 @@ void main() {
     tester,
   ) async {
     final controller = TestController()
-      ..value = const LumioPlayerState(initialized: true);
+      ..value = LumioPlayerState(initialized: true);
     await tester.pumpWidget(
       host(
         controller,
@@ -1752,7 +1748,7 @@ void main() {
     tester,
   ) async {
     final controller = TestController()
-      ..value = const LumioPlayerState(
+      ..value = LumioPlayerState(
         initialized: true,
         live: true,
         position: Duration(seconds: 38),
@@ -1811,7 +1807,7 @@ void main() {
       configuration: const LumioPlayerConfiguration(
         mode: LumioPlaybackMode.live,
       ),
-    )..value = const LumioPlayerState(initialized: true);
+    )..value = LumioPlayerState(initialized: true);
     await tester.pumpWidget(host(controller));
     expect(find.text('AO VIVO'), findsOneWidget);
     expect(find.byTooltip('Play'), findsNothing);
@@ -1824,7 +1820,7 @@ void main() {
 
   testWidgets('time remains available when progress is hidden', (tester) async {
     final controller = TestController()
-      ..value = const LumioPlayerState(
+      ..value = LumioPlayerState(
         initialized: true,
         duration: Duration(minutes: 1),
       );
@@ -1913,7 +1909,7 @@ void main() {
     tester,
   ) async {
     final controller = TestController()
-      ..value = const LumioPlayerState(
+      ..value = LumioPlayerState(
         initialized: true,
         duration: Duration(minutes: 2),
       );
@@ -1948,7 +1944,7 @@ void main() {
     tester,
   ) async {
     final controller = TestController()
-      ..value = const LumioPlayerState(
+      ..value = LumioPlayerState(
         initialized: true,
         buffering: true,
         error: LumioPlayerError(code: 'test', message: 'Failure'),
@@ -1981,7 +1977,7 @@ void main() {
     (tester) async {
       final controller = TestController();
       await tester.pumpWidget(host(controller, controls: false));
-      for (final state in const [
+      for (final state in [
         LumioPlayerState(buffering: true),
         LumioPlayerState(initialized: true, playing: true, buffering: true),
         LumioPlayerState(initialized: true, transitioning: true),
@@ -2012,10 +2008,7 @@ void main() {
         expect(background.shape, BoxShape.circle);
         expect(background.color, const Color(0x61000000));
       }
-      controller.value = const LumioPlayerState(
-        initialized: true,
-        playing: true,
-      );
+      controller.value = LumioPlayerState(initialized: true, playing: true);
       await tester.pump();
       expect(
         find.byKey(const ValueKey('lumio-loading-indicator')),
@@ -2027,7 +2020,7 @@ void main() {
 
   testWidgets('individual switches remove only their own UI', (tester) async {
     final controller = TestController()
-      ..value = const LumioPlayerState(
+      ..value = LumioPlayerState(
         initialized: true,
         duration: Duration(minutes: 1),
         error: LumioPlayerError(code: 'test', message: 'Failure'),
@@ -2107,7 +2100,7 @@ void main() {
     tester,
   ) async {
     final controller = TestController()
-      ..value = const LumioPlayerState(initialized: true);
+      ..value = LumioPlayerState(initialized: true);
     await tester.pumpWidget(
       MaterialApp(
         home: Scaffold(
@@ -2154,7 +2147,7 @@ void main() {
     tester,
   ) async {
     final controller = TestController()
-      ..value = const LumioPlayerState(initialized: true);
+      ..value = LumioPlayerState(initialized: true);
     for (final live in [false, true]) {
       controller.value = controller.value.copyWith(live: live);
       for (final layout in LumioControlsLayout.values) {
@@ -2197,7 +2190,7 @@ void main() {
 
   testWidgets('volume gain and mute-only capability', (tester) async {
     final controller = TestController()
-      ..value = const LumioPlayerState(initialized: true);
+      ..value = LumioPlayerState(initialized: true);
     await tester.pumpWidget(host(controller));
     expect(find.byKey(const ValueKey('lumio-volume')), findsNothing);
     expect(find.byTooltip('Mute'), findsOneWidget);
@@ -2245,7 +2238,7 @@ void main() {
     tester,
   ) async {
     final controller = TestController()
-      ..value = const LumioPlayerState(
+      ..value = LumioPlayerState(
         initialized: true,
         duration: Duration(minutes: 2),
       );
@@ -2293,7 +2286,7 @@ void main() {
     tester,
   ) async {
     final controller = TestController();
-    controller.value = const LumioPlayerState(
+    controller.value = LumioPlayerState(
       initialized: true,
       duration: Duration(minutes: 2),
     );
@@ -2330,7 +2323,7 @@ void main() {
 
   testWidgets('narrow controls, live mode and error retry', (tester) async {
     final controller = TestController();
-    controller.value = const LumioPlayerState(
+    controller.value = LumioPlayerState(
       live: true,
       error: LumioPlayerError(code: 'test', message: 'Failure'),
     );
@@ -2349,7 +2342,7 @@ void main() {
     tester,
   ) async {
     final controller = TestController()..fail = true;
-    controller.value = const LumioPlayerState(initialized: true);
+    controller.value = LumioPlayerState(initialized: true);
     await tester.pumpWidget(host(controller));
     await tester.tap(find.byTooltip('Play'));
     await tester.pump();

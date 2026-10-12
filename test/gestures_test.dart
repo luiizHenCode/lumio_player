@@ -174,7 +174,7 @@ void main() {
       tester,
     ) async {
       final controller = TestController()
-        ..value = const LumioPlayerState(initialized: true, playing: true);
+        ..value = LumioPlayerState(initialized: true, playing: true);
       await tester.pumpWidget(
         host(
           controller,
@@ -197,7 +197,7 @@ void main() {
       '$placement single tap toggles visible compact visible and restarts deadline',
       (tester) async {
         final controller = TestController()
-          ..value = const LumioPlayerState(initialized: true, playing: true);
+          ..value = LumioPlayerState(initialized: true, playing: true);
         await tester.pumpWidget(
           host(
             controller,
@@ -232,7 +232,7 @@ void main() {
       tester,
     ) async {
       final controller = TestController()
-        ..value = const LumioPlayerState(initialized: true, playing: true);
+        ..value = LumioPlayerState(initialized: true, playing: true);
       await tester.pumpWidget(
         host(
           controller,
@@ -256,7 +256,7 @@ void main() {
       tester,
     ) async {
       final controller = TestController()
-        ..value = const LumioPlayerState(initialized: true, playing: true);
+        ..value = LumioPlayerState(initialized: true, playing: true);
       await tester.pumpWidget(
         host(
           controller,
@@ -286,7 +286,7 @@ void main() {
       '$placement double tap seeks without single tap compact toggle',
       (tester) async {
         final controller = TestController()
-          ..value = const LumioPlayerState(
+          ..value = LumioPlayerState(
             initialized: true,
             playing: true,
             duration: Duration(minutes: 1),
@@ -321,7 +321,7 @@ void main() {
       tester,
     ) async {
       final controller = TestController()
-        ..value = const LumioPlayerState(initialized: true, playing: true);
+        ..value = LumioPlayerState(initialized: true, playing: true);
       await tester.pumpWidget(
         host(
           controller,
@@ -358,7 +358,7 @@ void main() {
     'ready paused media toggles and stays hidden across paused state updates',
     (tester) async {
       final controller = TestController()
-        ..value = const LumioPlayerState(initialized: true);
+        ..value = LumioPlayerState(initialized: true);
       await tester.pumpWidget(
         host(
           controller,
@@ -391,10 +391,10 @@ void main() {
   );
 
   for (final state in [
-    const LumioPlayerState(),
-    const LumioPlayerState(initialized: true, transitioning: true),
-    const LumioPlayerState(initialized: true, playing: true, buffering: true),
-    const LumioPlayerState(
+    LumioPlayerState(),
+    LumioPlayerState(initialized: true, transitioning: true),
+    LumioPlayerState(initialized: true, playing: true, buffering: true),
+    LumioPlayerState(
       initialized: true,
       playing: true,
       error: LumioPlayerError(code: 'test', message: 'Failure'),
@@ -423,7 +423,7 @@ void main() {
     tester,
   ) async {
     final controller = TestController()
-      ..value = const LumioPlayerState(initialized: true, playing: true);
+      ..value = LumioPlayerState(initialized: true, playing: true);
     await tester.pumpWidget(
       host(
         controller,
@@ -700,11 +700,7 @@ void main() {
     'explicit developer rate cancels hold without reverting that rate',
     (tester) async {
       final controller = TestController()
-        ..value = const LumioPlayerState(
-          initialized: true,
-          playing: true,
-          speed: 4,
-        );
+        ..value = LumioPlayerState(initialized: true, playing: true, speed: 4);
       await tester.pumpWidget(host(controller));
       final gesture = await tester.startGesture(
         tester.getCenter(find.byKey(surfaceKey)),
@@ -724,17 +720,9 @@ void main() {
     'swapping controllers restores only the controller that owns the hold',
     (tester) async {
       final first = TestController()
-        ..value = const LumioPlayerState(
-          initialized: true,
-          playing: true,
-          speed: 4,
-        );
+        ..value = LumioPlayerState(initialized: true, playing: true, speed: 4);
       final second = TestController()
-        ..value = const LumioPlayerState(
-          initialized: true,
-          playing: true,
-          speed: 3,
-        );
+        ..value = LumioPlayerState(initialized: true, playing: true, speed: 3);
       await tester.pumpWidget(host(first));
       final gesture = await tester.startGesture(
         tester.getCenter(find.byKey(surfaceKey)),
@@ -756,7 +744,7 @@ void main() {
     tester,
   ) async {
     final controller = TestController()
-      ..value = const LumioPlayerState(
+      ..value = LumioPlayerState(
         initialized: true,
         duration: Duration(seconds: 30),
         position: Duration(seconds: 5),
@@ -778,7 +766,7 @@ void main() {
     tester,
   ) async {
     final controller = TestController()
-      ..value = const LumioPlayerState(
+      ..value = LumioPlayerState(
         initialized: true,
         duration: Duration(minutes: 1),
       );
@@ -795,13 +783,13 @@ void main() {
     await doubleTap(tester, point);
     expect(controller.sought, const Duration(seconds: 3));
     for (final state in [
-      const LumioPlayerState(
+      LumioPlayerState(
         live: true,
         initialized: true,
         duration: Duration(minutes: 1),
       ),
-      const LumioPlayerState(duration: Duration(minutes: 1)),
-      const LumioPlayerState(
+      LumioPlayerState(duration: Duration(minutes: 1)),
+      LumioPlayerState(
         initialized: true,
         duration: Duration(minutes: 1),
         error: LumioPlayerError(code: 'test', message: 'Failure'),
@@ -820,7 +808,7 @@ void main() {
     'master switches and individual gesture switches disable commands',
     (tester) async {
       final controller = TestController()
-        ..value = const LumioPlayerState(
+        ..value = LumioPlayerState(
           initialized: true,
           duration: Duration(minutes: 1),
         );
@@ -862,7 +850,7 @@ void main() {
     tester,
   ) async {
     final controller = TestController()
-      ..value = const LumioPlayerState(initialized: true, speed: 3);
+      ..value = LumioPlayerState(initialized: true, speed: 3);
     await tester.pumpWidget(host(controller));
     final point = tester.getCenter(find.byKey(surfaceKey));
     final gesture = await tester.startGesture(point);
@@ -880,7 +868,7 @@ void main() {
     tester,
   ) async {
     final controller = DelayedSpeedController()
-      ..value = const LumioPlayerState(initialized: true, speed: 4);
+      ..value = LumioPlayerState(initialized: true, speed: 4);
     await tester.pumpWidget(host(controller));
     final gesture = await tester.startGesture(
       tester.getCenter(find.byKey(surfaceKey)),
@@ -902,7 +890,7 @@ void main() {
     tester,
   ) async {
     final controller = TestController()
-      ..value = const LumioPlayerState(initialized: true, speed: 3);
+      ..value = LumioPlayerState(initialized: true, speed: 3);
     await tester.pumpWidget(host(controller));
     final gesture = await tester.startGesture(
       tester.getCenter(find.byKey(surfaceKey)),
@@ -931,7 +919,7 @@ void main() {
   ) async {
     final controller = TestController()
       ..testSource = LumioSource.asset('first.mp4')
-      ..value = const LumioPlayerState(initialized: true, speed: 3);
+      ..value = LumioPlayerState(initialized: true, speed: 3);
     await tester.pumpWidget(host(controller));
     final gesture = await tester.startGesture(
       tester.getCenter(find.byKey(surfaceKey)),
@@ -951,7 +939,7 @@ void main() {
     tester,
   ) async {
     final controller = TestController()
-      ..value = const LumioPlayerState(initialized: true, speed: 3);
+      ..value = LumioPlayerState(initialized: true, speed: 3);
     await tester.pumpWidget(host(controller));
     final gesture = await tester.startGesture(
       tester.getCenter(find.byKey(surfaceKey)),
@@ -977,7 +965,7 @@ void main() {
     'pinch is opt-in, clamped, reset on source change; no hold during pinch',
     (tester) async {
       final controller = TestController()
-        ..value = const LumioPlayerState(initialized: true);
+        ..value = LumioPlayerState(initialized: true);
       await tester.pumpWidget(host(controller));
       await pinch(tester);
       expect(zoom(tester), 1);
@@ -1020,7 +1008,7 @@ void main() {
 
   testWidgets('second pointer cancels active hold', (tester) async {
     final controller = TestController()
-      ..value = const LumioPlayerState(initialized: true);
+      ..value = LumioPlayerState(initialized: true);
     await tester.pumpWidget(
       host(
         controller,
@@ -1045,7 +1033,7 @@ void main() {
     'compact deadline survives position events, tap reveals and pause stays visible',
     (tester) async {
       final controller = TestController()
-        ..value = const LumioPlayerState(
+        ..value = LumioPlayerState(
           initialized: true,
           playing: true,
           duration: Duration(minutes: 1),
@@ -1086,7 +1074,7 @@ void main() {
     tester,
   ) async {
     final controller = TestController()
-      ..value = const LumioPlayerState(initialized: true, playing: true);
+      ..value = LumioPlayerState(initialized: true, playing: true);
     await tester.pumpWidget(
       host(
         controller,

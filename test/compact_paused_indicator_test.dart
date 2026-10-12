@@ -10,7 +10,7 @@ void main() {
       tester,
     ) async {
       final controller = TestController()
-        ..value = const LumioPlayerState(
+        ..value = LumioPlayerState(
           initialized: true,
           duration: Duration(seconds: 20),
         );

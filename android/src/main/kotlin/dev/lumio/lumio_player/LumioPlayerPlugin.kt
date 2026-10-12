@@ -8,6 +8,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
+
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
@@ -32,6 +33,9 @@ import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.view.TextureRegistry
+import io.flutter.plugin.common.StandardMessageCodec
+import io.flutter.plugin.platform.PlatformView
+import io.flutter.plugin.platform.PlatformViewFactory
 import java.io.File
 import java.io.IOException
 
@@ -55,6 +59,17 @@ class LumioPlayerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         this.binding = binding
         handler = Handler(Looper.getMainLooper())
+        binding.platformViewRegistry.registerViewFactory(
+            "lumio_player/native_view",
+            object : PlatformViewFactory(StandardMessageCodec.INSTANCE) {
+                override fun create(context: Context, viewId: Int, args: Any?): PlatformView {
+                    check(this@LumioPlayerPlugin.binding === binding) { "The Flutter engine is detached" }
+                    val instance = lookup(args as? Map<*, *> ?: emptyMap<Any, Any>())
+                    require(instance.nativeSurface != null) { "Player was not created with viewType platformView" }
+                    return NativePlayerView(context, instance.nativeSurface)
+                }
+            },
+        )
         methods = MethodChannel(binding.binaryMessenger, "lumio_player/methods").also {
             it.setMethodCallHandler(this)
         }
@@ -86,18 +101,27 @@ class LumioPlayerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             when (call.method) {
                 "create" -> {
                     val engine = requireNotNull(binding)
-                    val producer = engine.textureRegistry.createSurfaceProducer()
+                    val viewType = parseViewType(args)
+                    val producer = if (viewType == PlayerViewType.texture) engine.textureRegistry.createSurfaceProducer() else null
                     val id = nextId++
                     val created = try {
                         Instance(id, producer, engine.applicationContext)
                     } catch (error: Exception) {
-                        runCatching { producer.release() }.exceptionOrNull()?.let { error.addSuppressed(it) }
+                        runCatching { producer?.release() }.exceptionOrNull()?.let { error.addSuppressed(it) }
                         throw error
                     }
                     players[id] = created
-                    result.success(mapOf("id" to id, "textureId" to producer.id()))
+                    result.success(buildMap<String, Any> {
+                        put("id", id)
+                        producer?.let { put("textureId", it.id()) }
+                    })
                     created.emitState()
                     if (players.size == 1) handler?.postDelayed(tick, 500)
+                    return
+                }
+                "getPosition" -> {
+                    instance = lookup(args)
+                    result.success(instance.position())
                     return
                 }
                 "diagnostics" -> {
@@ -208,7 +232,7 @@ class LumioPlayerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
     private inner class Instance(
         val id: Long,
-        private val producer: TextureRegistry.SurfaceProducer,
+        private val producer: TextureRegistry.SurfaceProducer?,
         private val context: Context,
     ) : Player.Listener, AnalyticsListener, TextureRegistry.SurfaceProducer.Callback {
         var player: ExoPlayer = buildPlayer(PlaybackConfig())
@@ -226,7 +250,8 @@ class LumioPlayerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         private var initialized = false
         private val hlsLiveSegmentFailure = HlsLiveSegmentFailure()
         private var requestedLive = false
-        private var surfaceAvailable = true
+        val nativeSurface = if (producer == null) NativeSurfaceBinding { player } else null
+        private var surfaceAvailable = producer != null
         private var sourceType: String? = null
         private var sourceFormat: String? = null
                 private var sources = emptyList<PreparedSource>()
@@ -242,16 +267,16 @@ class LumioPlayerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
         init {
             try {
-                producer.setSize(1, 1)
-                producer.setCallback(this)
+                producer?.setSize(1, 1)
+                producer?.setCallback(this)
                 player.addListener(this)
                 player.addAnalyticsListener(this)
-                player.setVideoSurface(producer.surface)
+                producer?.let { player.setVideoSurface(it.surface) }
             } catch (error: Exception) {
                 released = true
                 runCatching {
                     cleanupAll(
-                        { producer.setCallback(null) },
+                        { producer?.setCallback(null) },
                         { player.removeListener(this) },
                         { player.removeAnalyticsListener(this) },
                         { player.clearVideoSurface() },
@@ -334,7 +359,7 @@ class LumioPlayerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             val config = PlaybackConfig.parse(args["config"])
             // Resolve and validate every source before disturbing the existing player.
             val prepared = request.sources.map { prepareSource(it, config) }
-            // Buffer configuration belongs to the player, so reopen replaces it without replacing the texture.
+            // Buffer configuration belongs to the player; reopen preserves the rendering output's owner.
             val replacement = buildPlayer(config)
             try {
                 previewSeek.sourceChanged()
@@ -366,7 +391,8 @@ class LumioPlayerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             lastError = null
             player.addListener(this)
             player.addAnalyticsListener(this)
-            if (surfaceAvailable) player.setVideoSurface(producer.surface)
+            if (surfaceAvailable) producer?.let { player.setVideoSurface(it.surface) }
+            nativeSurface?.rebind()
             player.volume = config.volume
             player.setPlaybackSpeed(config.speed)
             player.repeatMode = playlistRepeatMode(config.looping, loopPlaylist)
@@ -400,7 +426,7 @@ class LumioPlayerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         override fun onSurfaceAvailable() {
             if (!released) {
                 surfaceAvailable = true
-                player.setVideoSurface(producer.surface)
+                producer?.let { player.setVideoSurface(it.surface) }
             }
         }
 
@@ -417,7 +443,7 @@ class LumioPlayerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
         override fun onVideoSizeChanged(videoSize: VideoSize) {
             if (!released && videoSize.width > 0 && videoSize.height > 0) {
-                resizeAndBindVideoSurface(player, producer, videoSize.width, videoSize.height, surfaceAvailable)
+                producer?.let { resizeAndBindVideoSurface(player, it, videoSize.width, videoSize.height, surfaceAvailable) }
                 Log.d("LumioPlayer", "Player $id: videoSize=${videoSize.width}x${videoSize.height}, surfaceAvailable=$surfaceAvailable")
             }
         }
@@ -513,6 +539,8 @@ class LumioPlayerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             sink?.success(lastError)
         }
 
+        fun position(): Long = playerPosition(player, hasSource)
+
         private fun state(): Map<String, Any> = mapOf(
             "id" to id,
             "type" to "state",
@@ -522,11 +550,12 @@ class LumioPlayerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             "playing" to player.isPlaying,
             "buffering" to (hasSource && player.playbackState == Player.STATE_BUFFERING),
             "completed" to (player.playbackState == Player.STATE_ENDED),
-            "positionMs" to player.currentPosition.coerceAtLeast(0),
+            "positionMs" to position(),
             "durationMs" to player.duration.let { if (it == C.TIME_UNSET) 0L else it.coerceAtLeast(0) },
             "width" to player.videoSize.width,
             "height" to player.videoSize.height,
             "bufferedPositionMs" to player.bufferedPosition.coerceAtLeast(0),
+            "bufferedRanges" to knownBufferedRanges(player, hasSource),
             "live" to (requestedLive || player.isCurrentMediaItemLive),
             "volume" to player.volume.toDouble(),
             "speed" to player.playbackParameters.speed.toDouble(),
@@ -538,11 +567,12 @@ class LumioPlayerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
         fun diagnostics(): Map<String, Any?> = mapOf(
             "state" to state(),
-            "textureId" to producer.id(),
-            "surfaceAvailable" to surfaceAvailable,
+            "textureId" to producer?.id(),
+            "viewType" to if (producer == null) "platformView" else "texture",
+            "surfaceAvailable" to (nativeSurface?.attached ?: surfaceAvailable),
             "previewSeekPending" to previewSeek.isPending,
             "previewSeekTimeoutCount" to previewSeek.timeoutCount,
-            "handlesCropAndRotation" to producer.handlesCropAndRotation(),
+            "handlesCropAndRotation" to producer?.handlesCropAndRotation(),
             "sourceType" to sourceType,
             "sourceFormat" to sourceFormat,
             "videoMimeType" to player.videoFormat?.sampleMimeType,
@@ -582,12 +612,13 @@ class LumioPlayerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             lastError = null
             cleanupAll(
                 { previewSeek.sourceChanged() },
-                { producer.setCallback(null) },
+                { nativeSurface?.close() },
+                { producer?.setCallback(null) },
                 { player.removeListener(this) },
                 { player.removeAnalyticsListener(this) },
                 { player.clearVideoSurface() },
                 { player.release() },
-                { producer.release() },
+                { producer?.release() },
             )
         }
     }

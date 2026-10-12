@@ -6,6 +6,7 @@ import Foundation
 @main
 struct ConfigurationTests {
   static func main() throws {
+    try testViewTypeAndTimeline()
     let defaults = try LumioConfiguration([:])
     precondition(!defaults.live && !defaults.autoPlay && !defaults.looping && !defaults.loopPlaylist)
     precondition(defaults.volume == 1 && defaults.speed == 1 && defaults.buffers.isEmpty)
@@ -70,6 +71,33 @@ struct ConfigurationTests {
     try testPlaylistArguments()
     try testLiveSeek()
     print("PASS: defaults, full configuration, \(valid.count) valid boundaries, \(invalid.count) invalid configurations, seek arguments, playlist indices/loop policy, and live-seek targets/rejections")
+  }
+
+  static func testViewTypeAndTimeline() throws {
+    let defaultType = try LumioViewType.parse([:])
+    let texture = try LumioViewType.parse(["viewType": "texture"])
+    let platform = try LumioViewType.parse(["viewType": "platformView"])
+    precondition(defaultType == .texture && texture == .texture && platform == .platformView)
+    for raw: Any in ["unknown", "Texture", true, 1, NSNull()] {
+      do { _ = try LumioViewType.parse(["viewType": raw]); fatalError("Accepted invalid viewType") }
+      catch let failure as LumioFailure { precondition(failure.code == "invalid_argument") }
+    }
+    precondition(lumioMilliseconds(.invalid) == 0)
+    precondition(lumioMilliseconds(.indefinite) == 0)
+    precondition(lumioMilliseconds(.positiveInfinity) == 0)
+    precondition(lumioMilliseconds(CMTime(value: -1, timescale: 1)) == 0)
+    precondition(lumioMilliseconds(CMTime(value: 12345, timescale: 1000)) == 12345)
+    let ranges = lumioBufferedRanges([
+      CMTimeRange(start: CMTime(value: 12, timescale: 1), duration: CMTime(value: 3, timescale: 1)),
+      CMTimeRange(start: CMTime(value: 20, timescale: 1), duration: CMTime(value: 2, timescale: 1)),
+      .invalid, .zero,
+      CMTimeRange(start: .indefinite, duration: CMTime(value: 1, timescale: 1)),
+      CMTimeRange(start: CMTime(value: -2, timescale: 1), duration: CMTime(value: 1, timescale: 1)),
+      CMTimeRange(start: .zero, duration: .positiveInfinity)
+    ])
+    precondition(ranges == [["startMs": 12000, "endMs": 15000], ["startMs": 20000, "endMs": 22000]])
+    precondition(lumioBufferedRanges([]).isEmpty)
+    print("PASS: viewType defaults/rejections, nonnegative position, valid/disconnected buffered ranges")
   }
 
   static func testAudioAndHeaders() throws {

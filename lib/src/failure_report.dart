@@ -211,6 +211,8 @@ Map<String, Object?> safeFailureDiagnostics(Object? input, [int depth = 0]) {
 }
 
 const _numeric = {
+  'initializationTimeoutMs',
+  'commandTimeoutMs',
   'errorCode',
   'nativeCode',
   'codeNumber',

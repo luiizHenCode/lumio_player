@@ -37,11 +37,49 @@ final class NativePlaylistTests: XCTestCase {
   }
 
   private func makePlayer(_ registry: PlaylistTextureRegistry = PlaylistTextureRegistry(),
+                          viewType: LumioViewType = .texture,
                           emit: @escaping ([String: Any]) -> Void) -> LumioNativePlayer {
     XCTAssertTrue(Thread.isMainThread)
-    let player = LumioNativePlayer(id: 1, registry: registry, emit: emit)
+    let player = LumioNativePlayer(id: 1, registry: registry, viewType: viewType, emit: emit)
     players.append(player)
     return player
+  }
+
+  func testPlatformViewReadySeekAndPositionUseTheSameQueue() throws {
+    let ready = expectation(description: "Platform-view item becomes ready")
+    let registry = PlaylistTextureRegistry()
+    var fulfilled = false
+    var latest: [String: Any] = [:]
+    let player = makePlayer(registry, viewType: .platformView) { event in
+      guard event["type"] as? String == "state" else { return }
+      latest = event
+      if event["initialized"] as? Bool == true && !fulfilled {
+        fulfilled = true
+        ready.fulfill()
+      }
+    }
+    XCTAssertEqual(player.getPosition(), 0)
+    let surface = LumioPlayerSurface(frame: .zero, player: player)
+    let queue = surface.playerLayer.player as! AVQueuePlayer
+    player.open(url: try audio(), configuration: try LumioConfiguration([:]))
+    wait(for: [ready], timeout: 10)
+    XCTAssertTrue(surface.playerLayer.player === queue)
+    XCTAssertTrue(queue.currentItem!.outputs.isEmpty)
+    let sought = expectation(description: "Native seek completes")
+    player.seek(milliseconds: 500) { result in
+      XCTAssertNil(result)
+      sought.fulfill()
+    }
+    wait(for: [sought], timeout: 5)
+    XCTAssertEqual(player.getPosition(), 500, accuracy: 20)
+    player.emitState()
+    XCTAssertEqual(latest["positionMs"] as? Int64, player.getPosition())
+    XCTAssertNotNil(latest["bufferedRanges"] as? [[String: Int64]])
+    XCTAssertFalse(latest["playing"] as? Bool ?? true)
+    XCTAssertEqual(registry.registrations, 0)
+    player.dispose()
+    XCTAssertNil(surface.playerLayer.player)
+    XCTAssertEqual(registry.removals, 0)
   }
 
   func testNativeAdvanceAndFinalCompletion() throws {

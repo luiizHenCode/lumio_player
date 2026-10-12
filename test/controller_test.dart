@@ -87,12 +87,14 @@ void main() {
     bool fallback = false,
     bool autoPlay = true,
     Duration initializationTimeout = const Duration(seconds: 1),
+    Duration? commandTimeout,
   }) {
     final controller = LumioPlayerController(
       configuration: LumioPlayerConfiguration(
         engine: engine,
         allowAutomaticFallback: fallback,
         initializationTimeout: initializationTimeout,
+        commandTimeout: commandTimeout,
         autoPlay: autoPlay,
       ),
       logger: logger,
@@ -839,6 +841,89 @@ void main() {
       expect(controller.value.transitioning, isFalse);
     },
   );
+
+  test(
+    'slow native open uses initialization budget, not command budget',
+    () async {
+      final tester = _Clock();
+      addTearDown(() => finish(tester));
+      final controller = player(
+        commandTimeout: const Duration(milliseconds: 20),
+      );
+      native.intercept = (call) async {
+        if (call.method == 'open') {
+          await Future<void>.delayed(const Duration(milliseconds: 80));
+        }
+        return native.respond(call);
+      };
+      await open(tester, controller);
+      expect(controller.value.initialized, isTrue);
+      expect(
+        controller.configuration.commandTimeout,
+        const Duration(milliseconds: 20),
+      );
+    },
+  );
+
+  for (final method in ['play', 'seek', 'getPosition', 'diagnostics']) {
+    test(
+      '$method uses command timeout independently of initialization',
+      () async {
+        final tester = _Clock();
+        addTearDown(() => finish(tester));
+        final controller = player(
+          commandTimeout: const Duration(milliseconds: 30),
+        );
+        await open(tester, controller);
+        final gate = Completer<Object?>();
+        native.intercept = (call) =>
+            call.method == method ? gate.future : native.respond(call);
+        final Future<Object?> action = switch (method) {
+          'play' => controller.play(),
+          'seek' => controller.seekTo(const Duration(seconds: 3)),
+          'getPosition' => controller.getPosition(),
+          _ => controller.diagnostics(),
+        };
+        await expectLater(
+          action.timeout(const Duration(milliseconds: 500)),
+          method == 'play' || method == 'seek'
+              ? throwsA(
+                  isA<LumioPlayerError>().having(
+                    (error) => error.code,
+                    'code',
+                    'command_timeout',
+                  ),
+                )
+              : throwsA(
+                  isA<TimeoutException>().having(
+                    (error) => error.duration,
+                    'duration',
+                    controller.configuration.commandTimeout,
+                  ),
+                ),
+        );
+        gate.complete(method == 'diagnostics' ? <String, Object?>{} : 3000);
+        await controller.pause();
+        expect(controller.value.position, Duration.zero);
+      },
+    );
+  }
+
+  test('dispose during command wait does not commit a late reply', () async {
+    final tester = _Clock();
+    addTearDown(() => finish(tester));
+    final controller = player(commandTimeout: const Duration(milliseconds: 30));
+    await open(tester, controller);
+    final gate = Completer<Object?>();
+    native.intercept = (call) =>
+        call.method == 'getPosition' ? gate.future : native.respond(call);
+    final querying = expectLater(controller.getPosition(), throwsStateError);
+    await tester.pump();
+    await controller.dispose();
+    await querying;
+    gate.complete(9000);
+    expect(controller.value.position, Duration.zero);
+  });
 
   test(
     'command timeout uses initializationTimeout and unblocks the queue',

@@ -458,6 +458,8 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState>
       _playlist!.items.length > 1 &&
       (_playlistIndex > 0 || _playlist!.loop);
   int? get textureId => _textureId;
+  int? get nativePlayerId => _id;
+  LumioNativeViewType get nativeViewType => configuration.nativeViewType;
   WebViewController? get webViewController => _web?.controller;
   LumioPlaybackEngine get requestedEngine => _requestedEngine;
   bool get looping => _looping;
@@ -476,6 +478,15 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState>
       detailedBufferControl: !web && android,
       volumeControl: !(web && defaultTargetPlatform == TargetPlatform.iOS),
       nativePlaylist: !web,
+      nativePlatformView:
+          !web &&
+          !kIsWeb &&
+          (android || defaultTargetPlatform == TargetPlatform.iOS),
+      supportsSurfaceCapture:
+          !web &&
+          !kIsWeb &&
+          (android || defaultTargetPlatform == TargetPlatform.iOS) &&
+          nativeViewType == LumioNativeViewType.texture,
       formats: Set.unmodifiable(
         web || !android
             ? {
@@ -627,6 +638,8 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState>
       transitioning: true,
       position: Duration.zero,
       duration: Duration.zero,
+      buffered: const [],
+      bufferedPosition: Duration.zero,
       playlistIndex: index,
       clearError: true,
     );
@@ -716,6 +729,7 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState>
     _lastPosition = null;
     _lastProgress = null;
     _stableSince = null;
+    value = value.copyWith(buffered: const [], bufferedPosition: Duration.zero);
     await _release();
     if (_disposed) throw StateError('Player disposed during initialization.');
     final generation = ++_generation;
@@ -799,7 +813,7 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState>
         );
         var createAbandoned = false;
         ++_pendingNativeCreations;
-        final creation = _bridge.create();
+        final creation = _bridge.create(viewType: nativeViewType);
         unawaited(
           creation.then<void>(
             (created) async {
@@ -838,7 +852,7 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState>
           throw StateError('Initialization cancelled.');
         }
         _id = (created['id'] as num).toInt();
-        _textureId = (created['textureId'] as num).toInt();
+        _textureId = (created['textureId'] as num?)?.toInt();
         config['autoPlay'] = autoPlay && _effectivePlayback && !recovering;
         _notifySurface();
         await guarded(
@@ -1009,13 +1023,19 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState>
         _source = playlist.items[index].source;
         _fallbackUsed = false;
       }
-      value = value
-          .apply(event)
-          .copyWith(
-            playlistIndex: _playlistIndex,
-            playlistLength: playlist?.items.length ?? value.playlistLength,
-            clearError: changed,
-          );
+      value =
+          (changed
+                  ? value.copyWith(
+                      buffered: const [],
+                      bufferedPosition: Duration.zero,
+                    )
+                  : value)
+              .apply(event)
+              .copyWith(
+                playlistIndex: _playlistIndex,
+                playlistLength: playlist?.items.length ?? value.playlistLength,
+                clearError: changed,
+              );
       if (value.engine == LumioPlaybackEngine.webview &&
           value.completed &&
           playlist != null &&
@@ -1104,6 +1124,60 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState>
       }
       if (value.initialized) await _command('pause');
     });
+  }
+
+  /// Query the active backend, not the last periodic state event.
+  /// Returns null before initialization. Stale queries and disposal throw
+  /// StateError; a result never updates state for a different source/engine.
+  Future<Duration?> getPosition() async {
+    if (_disposed) throw StateError('Lumio player has been disposed.');
+    if (!value.initialized) return null;
+    final generation = _generation;
+    final source = _source;
+    final index = _playlistIndex;
+    final revision = _recoveryRevision;
+    final fallback = _fallbackUsed;
+    final engine = value.engine;
+    final id = _id;
+    final web = _web;
+    void check() {
+      if (_disposed) throw StateError('Lumio player has been disposed.');
+      if (generation != _generation ||
+          !identical(source, _source) ||
+          index != _playlistIndex ||
+          revision != _recoveryRevision ||
+          fallback != _fallbackUsed ||
+          engine != value.engine ||
+          id != _id ||
+          !identical(web, _web)) {
+        throw StateError('Position query is no longer current.');
+      }
+    }
+
+    Duration? position;
+    await _serialize(() async {
+      check();
+      if (!value.initialized) return;
+      final Object? result;
+      try {
+        result =
+            await (web != null
+                    ? web.getPosition()
+                    : _bridge.invoke('getPosition', id!))
+                .timeout(configuration.commandTimeout);
+      } catch (_) {
+        check();
+        rethrow;
+      }
+      check();
+      if (result is! num || !result.isFinite || result < 0) {
+        throw StateError('Backend returned an invalid position.');
+      }
+      position = Duration(milliseconds: result.toInt());
+      value = value.copyWith(position: position);
+    });
+    check();
+    return position;
   }
 
   /// Optional execution-time guard, with the same semantics as [play].
@@ -1209,7 +1283,7 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState>
       } else if (_id != null) {
         await _bridge
             .invoke(method, _id!, args)
-            .timeout(configuration.initializationTimeout);
+            .timeout(configuration.commandTimeout);
       } else {
         throw StateError('No active engine.');
       }
@@ -1244,7 +1318,7 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState>
         ? <String, Object?>{}
         : (await _bridge
                   .invoke('diagnostics', _id!)
-                  .timeout(configuration.initializationTimeout))
+                  .timeout(configuration.commandTimeout))
               as Map;
     // Native access logs may contain signed URLs: recursively redact strings.
     Object? sanitize(Object? object) {
