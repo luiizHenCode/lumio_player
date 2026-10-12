@@ -141,6 +141,51 @@ void main() {
     await opening;
   }
 
+  test(
+    'web frame state and failure timings survive retry and late old bridge events',
+    () async {
+      final controller = player(engine: LumioPlaybackEngine.webview);
+      await controller.open(source);
+      final old = platform.web;
+      old.emit({
+        'type': 'state',
+        'initialized': true,
+        'playing': true,
+        'firstFrameSupported': true,
+        'hasRenderedFirstFrame': true,
+        'firstFrameEvidence': 'requestVideoFrameCallback',
+      });
+      expect(
+        controller.value.firstFrameEvidence,
+        LumioFirstFrameEvidence.requestVideoFrameCallback,
+      );
+      old.emit({
+        'type': 'error',
+        'code': 'media_error',
+        'message': '/Users/private https://secret/token',
+      });
+      await Future<void>.delayed(Duration.zero);
+      final startup =
+          (await controller.failureReport())!.metadata['startup'] as Map;
+      expect(startup['attempt'], 1);
+      expect(startup['stage'], 'failed');
+      expect(startup['evidence'], 'requestVideoFrameCallback');
+      expect(startup['firstFrameElapsedMs'], isA<int>());
+      await controller.retry();
+      expect(controller.startupDiagnostics['attempt'], 2);
+      expect(controller.startupDiagnostics['firstFrameElapsedMs'], isNull);
+      old.emit({
+        'type': 'state',
+        'hasRenderedFirstFrame': true,
+        'firstFrameSupported': true,
+        'firstFrameEvidence': 'loadedData',
+      });
+      expect(controller.value.hasRenderedFirstFrame, false);
+      expect((await controller.failureReport())!.metadata['startup'], startup);
+      await controller.dispose();
+    },
+  );
+
   testWidgets('web slow open is independent of command deadline', (
     tester,
   ) async {
@@ -270,6 +315,14 @@ void main() {
     expect(controller.value.engine, LumioPlaybackEngine.webview);
     expect(controller.value.initialized, isTrue);
     expect((await controller.diagnostics())['fallbackUsed'], isTrue);
+    expect(controller.startupDiagnostics['attempt'], 2);
+    expect(controller.startupDiagnostics['readinessElapsedMs'], isA<int>());
+    expect(controller.startupDiagnostics['firstFrameElapsedMs'], isNull);
+    final failedStartup =
+        (await controller.failureReport())!.metadata['startup'] as Map;
+    expect(failedStartup['attempt'], 1);
+    expect(failedStartup['stage'], 'failed');
+    expect(failedStartup['readinessElapsedMs'], isNull);
     await controller.dispose();
   });
 

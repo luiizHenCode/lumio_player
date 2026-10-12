@@ -2,6 +2,20 @@
 
 Esta checklist registra cenários de aceitação, não resultados já aprovados. Testes Dart com fake channels, compilação e testes de parsers não comprovam comportamento de rede, foco de áudio ou memória real.
 
+## Primeiro frame e startup — Fase 2 (validação física pendente)
+
+- [ ] Android textura/Platform View: readiness pode anteceder `renderer`; spinner permanece com playback solicitado, comandos continuam habilitados e a evidência aparece uma vez.
+- [ ] iOS textura: exigir `pixelBuffer`; iOS Platform View: exigir `layerReady`. Não tratar readiness/áudio como apresentação de vídeo.
+- [ ] Abrir com `autoPlay: false`: `open()` conclui e play/seek funcionam sem esperar frame. Repetir com áudio e vídeo sem áudio, volume zero.
+- [ ] WebView com callback: verificar `requestVideoFrameCallback`. Sem callback: `loadedData` só com dados e dimensões, sem alegar frame visível; áudio não depende de vídeo.
+- [ ] Selecionar o mesmo item, próximo item, nova fonte, retry, fallback e recovery: resetar frame/evidência/timings, incrementar `attempt`, ignorar callbacks atrasados de fonte/superfície antiga.
+- [ ] Seleção explícita nativa: snapshots antigos com `selectionEpoch` anterior não podem completar readiness, reaplicar frame ou reverter índice. Transições automáticas preservam o epoch atual; retry/nova engine reinicia em zero. Legacy sem epoch não garante isolamento de reseleção do mesmo índice.
+- [ ] Recovery com readiness/frame já disponíveis: manter fase `recovering` até concluir seek/play e encerrar `transitioning`; erro durante a transição continua `failed`.
+- [ ] Ausência de frame sozinha não dispara restart novo; observar loader honesto sem alterar o watchdog de posição existente.
+- [ ] Falhar antes/depois de readiness/frame: `failureReport.metadata.startup` preserva tentativa, timings e evidência antigos após substituir engine. Timings desconhecidos são `null`, não zero inventado.
+- [ ] Revisar snapshots/trace para ausência de URLs, mensagens, headers e paths. UUID deve vir de wrapper do host, nunca do plugin. Não chamar readiness de tempo de rede.
+- [ ] Dispose enquanto callback pendente: cancelar onde suportado e impedir evidência/atualizações tardias.
+
 ## Preparação
 
 - Testar pelo menos um iPhone físico e dois Android de fabricantes/versões diferentes, registrando aparelho, OS, engine, build e protocolo.

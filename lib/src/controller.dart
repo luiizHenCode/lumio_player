@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
 import 'models.dart';
+import 'startup_diagnostics.dart';
 import 'failure_report.dart';
 import 'native_bridge.dart';
 import 'recovery_configuration.dart';
@@ -52,9 +53,74 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState>
   LumioFailureReport? _lastFailure;
   LumioPlayerError? _recordedFailure;
   Future<void>? _failureDiagnostics;
+  LumioStartupDiagnostics? _startup;
+  int _startupAttempt = 0;
+  int _selectionEpoch = 0;
+  int? _nativeSelectionIndex;
+
+  /// Safe, deeply immutable, monotonic attempt snapshot; null timings mean unknown.
+  Map<String, Object?> get startupDiagnostics =>
+      _startup?.snapshot ??
+      const {
+        'attempt': 0,
+        'stage': 'idle',
+        'evidence': null,
+        'events': <Object?>[],
+      };
+
+  LumioPlaybackPhase get phase => value.phase;
+
+  /// True only while a retry is actually pending or reopening the live source.
+  /// A recoverable error alone does not imply that recovery will be attempted.
+  bool get isRecovering =>
+      !_disposed &&
+      (_recoveryTimer != null ||
+          _recoveryQueued ||
+          _recoveryInProgress ||
+          (_startup?.recovering == true && value.transitioning));
+
+  bool _awaitingFirstFrame(LumioPlayerState state) =>
+      configuration.mode != LumioPlaybackMode.audio &&
+      _effectivePlayback &&
+      state.initialized &&
+      state.firstFrameSupported &&
+      !state.hasRenderedFirstFrame &&
+      !state.completed &&
+      state.error == null;
+
+  /// Presentation only: never used for command readiness or recovery watchdogs.
+  bool get awaitingFirstFrame => _awaitingFirstFrame(value);
+
+  void _beginStartup({bool recovering = false, Stopwatch? clock}) {
+    _startup = LumioStartupDiagnostics(
+      ++_startupAttempt,
+      recovering: recovering,
+      clock: clock,
+    );
+  }
+
+  LumioPlaybackPhase _phaseFor(LumioPlayerState state) {
+    if (state.error != null) return LumioPlaybackPhase.failed;
+    if (_startup?.recovering == true && state.transitioning) {
+      return LumioPlaybackPhase.recovering;
+    }
+    if (!state.initialized) {
+      if (_startup == null) return LumioPlaybackPhase.idle;
+      return _startup!.createElapsedMs == null
+          ? LumioPlaybackPhase.connecting
+          : LumioPlaybackPhase.preparing;
+    }
+    if (_awaitingFirstFrame(state)) return LumioPlaybackPhase.ready;
+    if (state.buffering) return LumioPlaybackPhase.buffering;
+    return state.playing
+        ? LumioPlaybackPhase.playing
+        : LumioPlaybackPhase.ready;
+  }
 
   @override
   set value(LumioPlayerState state) {
+    state = state.copyWith(phase: _phaseFor(state));
+    if (!_disposed) _startup?.observe(state);
     final error = state.error;
     if (!_disposed && error != null && !identical(error, _recordedFailure)) {
       _recordFailure(error, state: state);
@@ -83,12 +149,14 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState>
   }) {
     if (_disposed || identical(error, _recordedFailure)) return;
     _recordedFailure = error;
+    _startup?.stage(LumioPlaybackPhase.failed);
     final playback = state ?? value;
     final report = LumioFailureReport(
       timestamp: DateTime.now().toUtc(),
       code: safeFailureCode(error.code),
       message: 'Playback failed. See the failure code and safe diagnostics.',
       metadata: {
+        'startup': startupDiagnostics,
         'engine': (error.engine ?? playback.engine).name,
         'requestedEngine': _requestedEngine.name,
         'platform': kIsWeb ? 'web' : defaultTargetPlatform.name,
@@ -215,6 +283,7 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState>
   int _intentRevision = 0, _recoveryRevision = 0, _attempts = 0;
   Timer? _watchdog, _recoveryTimer;
   bool _recoveryQueued = false;
+  bool _recoveryInProgress = false;
   Duration? _lastPosition;
   DateTime? _lastProgress, _stableSince;
 
@@ -233,6 +302,7 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState>
     if (_foreground == foreground) return;
     _foreground = foreground;
     _invalidateRecovery();
+    value = value;
     final revision = _intentRevision;
     unawaited(
       _serialize(() async {
@@ -274,6 +344,7 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState>
   }
 
   void _invalidateRecovery() {
+    final hadPendingRecovery = _recoveryTimer != null || _recoveryQueued;
     ++_recoveryRevision;
     _watchdog?.cancel();
     _watchdog = null;
@@ -283,6 +354,7 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState>
     _lastPosition = null;
     _lastProgress = null;
     _stableSince = null;
+    if (hadPendingRecovery && !_disposed) notifyListeners();
   }
 
   bool get _recoveryEligible =>
@@ -356,11 +428,18 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState>
     final engine = value.engine;
     _recoveryTimer = Timer(delay, () {
       _recoveryTimer = null;
-      if (revision != _recoveryRevision || !_recoveryEligible) return;
+      if (revision != _recoveryRevision || !_recoveryEligible) {
+        if (!_disposed) notifyListeners();
+        return;
+      }
       _recoveryQueued = true;
       unawaited(
         _serialize(() async {
-          if (revision != _recoveryRevision || !_recoveryEligible) return;
+          if (revision != _recoveryRevision || !_recoveryEligible) {
+            _recoveryQueued = false;
+            if (!_disposed) notifyListeners();
+            return;
+          }
           _recoveryQueued = false;
           ++_attempts;
           _log(
@@ -369,17 +448,24 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState>
             'Live network restart $_attempts/${recovery.maxAttempts}.',
             engine: engine,
           );
-          await _start(
-            engine,
-            autoPlay: _wantsPlayback,
-            recovering: true,
-            recoverToLive:
-                error.code == 'hls_live_segment_unavailable' ||
-                error.code == 'ios_live_network_interruption',
-          );
+          _recoveryInProgress = true;
+          try {
+            await _start(
+              engine,
+              autoPlay: _wantsPlayback,
+              recovering: true,
+              recoverToLive:
+                  error.code == 'hls_live_segment_unavailable' ||
+                  error.code == 'ios_live_network_interruption',
+            );
+          } finally {
+            _recoveryInProgress = false;
+            if (!_disposed) notifyListeners();
+          }
         }).catchError((Object _) {}),
       );
     });
+    notifyListeners();
   }
 
   void _armWatchdog() {
@@ -617,6 +703,8 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState>
       await _start(value.engine, autoPlay: _wantsPlayback);
       return;
     }
+    final selectionEpoch = ++_selectionEpoch;
+    _nativeSelectionIndex = index;
     final ready = Completer<void>();
     final cancelled = Completer<void>();
     _cancelPending = cancelled;
@@ -630,7 +718,10 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState>
     _ready = ready;
     final waiting = ready.future.timeout(configuration.initializationTimeout);
     unawaited(waiting.then<void>((_) {}, onError: (Object _, StackTrace _) {}));
+    _beginStartup();
+    _startup?.created();
     value = value.copyWith(
+      clearFirstFrame: true,
       initialized: false,
       playing: false,
       completed: false,
@@ -645,7 +736,10 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState>
     );
     try {
       await guarded(
-        _bridge.invoke('selectPlaylistItem', _id!, {'index': index}),
+        _bridge.invoke('selectPlaylistItem', _id!, {
+          'index': index,
+          'selectionEpoch': selectionEpoch,
+        }),
       );
       final requestedPlay = _effectivePlayback;
       if (requestedPlay) await guarded(_bridge.invoke('play', _id!));
@@ -680,6 +774,7 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState>
     } finally {
       if (identical(_ready, ready)) _ready = null;
       if (identical(_cancelPending, cancelled)) _cancelPending = null;
+      if (_selectionEpoch == selectionEpoch) _nativeSelectionIndex = null;
     }
   }
 
@@ -724,6 +819,7 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState>
     bool recovering = false,
     bool recoverToLive = false,
   }) async {
+    final startupClock = Stopwatch()..start();
     _watchdog?.cancel();
     _watchdog = null;
     _lastPosition = null;
@@ -732,6 +828,9 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState>
     value = value.copyWith(buffered: const [], bufferedPosition: Duration.zero);
     await _release();
     if (_disposed) throw StateError('Player disposed during initialization.');
+    _selectionEpoch = 0;
+    _nativeSelectionIndex = null;
+    _beginStartup(recovering: recovering, clock: startupClock);
     final generation = ++_generation;
     final source = _source!;
     value = LumioPlayerState(
@@ -766,7 +865,10 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState>
       'volume': _volume,
       'speed': _speed,
       'looping': _looping,
-      if (engine == LumioPlaybackEngine.webview) 'fit': _videoFit.name,
+      if (engine == LumioPlaybackEngine.webview) ...{
+        'fit': _videoFit.name,
+        'mode': configuration.mode.name,
+      },
       if (_playlist != null) 'loopPlaylist': _playlist!.loop,
     };
     _log(
@@ -796,7 +898,8 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState>
           onEvent: (event) => _onEvent(event, generation),
         );
         _web = web;
-        _notifySurface();
+        _startup?.created();
+        value = value;
         await guarded(web.open(source.toMap(), config));
       } else {
         // Subscribe before create/open to capture early native state events.
@@ -851,10 +954,11 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState>
           );
           throw StateError('Initialization cancelled.');
         }
+        _startup?.created();
         _id = (created['id'] as num).toInt();
         _textureId = (created['textureId'] as num?)?.toInt();
         config['autoPlay'] = autoPlay && _effectivePlayback && !recovering;
-        _notifySurface();
+        value = value;
         await guarded(
           _bridge.invoke(_playlist == null ? 'open' : 'openPlaylist', _id!, {
             if (_playlist == null)
@@ -1008,6 +1112,18 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState>
         engine: value.engine,
       );
     } else if (event['type'] == 'state') {
+      if (value.engine == LumioPlaybackEngine.native) {
+        final epoch = event['selectionEpoch'];
+        if (epoch is num && epoch != _selectionEpoch) return;
+        // Legacy snapshots cannot distinguish same-index reselections. At
+        // least prevent an old index from undoing an explicit pending choice.
+        if (epoch is! num &&
+            _nativeSelectionIndex != null &&
+            event['playlistIndex'] is num &&
+            event['playlistIndex'] != _nativeSelectionIndex) {
+          return;
+        }
+      }
       final index = (event['playlistIndex'] as num?)?.toInt();
       final playlist = _playlist;
       final changed =
@@ -1017,6 +1133,7 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState>
           index < playlist.items.length &&
           index != _playlistIndex;
       if (changed) {
+        _beginStartup();
         _invalidateRecovery();
         _attempts = 0;
         _playlistIndex = index;
@@ -1026,6 +1143,7 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState>
       value =
           (changed
                   ? value.copyWith(
+                      clearFirstFrame: true,
                       buffered: const [],
                       bufferedPosition: Duration.zero,
                     )
@@ -1091,13 +1209,17 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState>
   /// silently, so callers cannot mistake cancellation for completed playback.
   Future<void> play({bool Function()? isCurrent}) {
     final revision = isCurrent == null ? ++_intentRevision : _intentRevision;
-    if (isCurrent == null) _wantsPlayback = true;
+    if (isCurrent == null) {
+      _wantsPlayback = true;
+      if (!_disposed) value = value;
+    }
     return _serialize(() async {
       _checkCurrent(isCurrent);
       if (isCurrent != null) {
         _wantsPlayback = true;
         ++_intentRevision;
       }
+      value = value;
       if (!_foreground && !configuration.allowBackgroundPlayback) return;
       await _command('play');
       // A later pause already owns intent; command completion must not undo it.
@@ -1114,6 +1236,7 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState>
       _wantsPlayback = false;
       ++_intentRevision;
       _invalidateRecovery();
+      if (!_disposed) value = value;
     }
     return _serialize(() async {
       _checkCurrent(isCurrent);
@@ -1122,6 +1245,7 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState>
         ++_intentRevision;
         _invalidateRecovery();
       }
+      value = value;
       if (value.initialized) await _command('pause');
     });
   }
@@ -1337,6 +1461,11 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState>
       'requestedEngine': _requestedEngine.name,
       'fallbackUsed': _fallbackUsed,
       'initialized': value.initialized,
+      'phase': value.phase.name,
+      'hasRenderedFirstFrame': value.hasRenderedFirstFrame,
+      'firstFrameSupported': value.firstFrameSupported,
+      'firstFrameEvidence': value.firstFrameEvidence?.name,
+      'startup': startupDiagnostics,
       'playback': {
         'mode': configuration.mode.name,
         'fit': _videoFit.name,
@@ -1507,6 +1636,7 @@ class LumioPlayerController extends ValueNotifier<LumioPlayerState>
     final completion = Completer<void>();
     _disposal = completion.future;
     _disposed = true;
+    _startup?.stop();
     WidgetsBinding.instance.removeObserver(this);
     _invalidateRecovery();
     _disposalWatch.start();

@@ -106,7 +106,8 @@ public final class LumioPlayerPlugin: NSObject, FlutterPlugin, FlutterStreamHand
         result(nil)
       case "selectPlaylistItem":
         let index = try lumioPlaylistIndex(arguments, length: player.playlistLength)
-        player.selectPlaylistItem(index: index)
+        let epoch = try lumioSelectionEpoch(arguments)
+        player.selectPlaylistItem(index: index, selectionEpoch: epoch)
         result(nil)
       case "play": player.play(); result(nil)
       case "pause": player.pause(); result(nil)

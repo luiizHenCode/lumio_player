@@ -23,23 +23,74 @@ final class LumioNativePlayer: NSObject, FlutterTexture {
   private let player = AVQueuePlayer()
   let viewType: LumioViewType
   private weak var attachedLayer: AVPlayerLayer?
+  private var layerObservation: NSKeyValueObservation?
+  private var firstFrame = LumioFirstFrameEvidence()
+  private var layerVisible = true
+
+  private func resetFirstFrame() {
+    layerObservation?.invalidate()
+    layerObservation = nil
+    let layer = viewType == .platformView ? attachedLayer : nil
+    // Disconnect even for same-item selection: a reused layer may retain ready=true.
+    // Observe BEFORE rebind so synchronous readiness cannot be missed.
+    layer?.player = nil
+    firstFrame.reset(generation: generation, item: item.map { ObjectIdentifier($0) },
+                     layer: layer.map { ObjectIdentifier($0) },
+                     layerReady: layer?.isReadyForDisplay ?? true)
+    guard !disposed, layerVisible, let layer = layer else { return }
+    guard let current = item, player.currentItem === current else {
+      // Preserve surface/queue ownership for an empty player, without evidence.
+      if item == nil && player.currentItem == nil { layer.player = player }
+      return
+    }
+    let token = firstFrame.token
+    layerObservation = layer.observe(\.isReadyForDisplay, options: [.new]) { [weak self, weak current] observed, change in
+      let ready = change.newValue ?? observed.isReadyForDisplay
+      let update = { [weak self, weak current, weak observed] in
+        guard let self = self, !self.disposed, let current = current, let observed = observed,
+              self.generation == token.generation, self.item === current,
+              self.player.currentItem === current, self.attachedLayer === observed,
+              observed.player === self.player else { return }
+        if self.firstFrame.layerReady(ready, token: token) { self.emitState() }
+      }
+      if Thread.isMainThread { update() } else { DispatchQueue.main.async(execute: update) }
+    }
+    firstFrame.qualifyLayerBinding(token)
+    layer.player = player
+    // Catch readiness occurring synchronously inside the setter. A retained true
+    // baseline is not qualified by this sample; it needs a new bind notification.
+    if firstFrame.token == token, item === current, player.currentItem === current,
+       attachedLayer === layer, layer.player === player,
+       firstFrame.layerReady(layer.isReadyForDisplay, token: token, bindingSnapshot: true) {
+      emitState()
+    }
+  }
 
   func attachLayer(_ layer: AVPlayerLayer) {
     guard !disposed, viewType == .platformView else { return }
+    layerObservation?.invalidate()
     attachedLayer?.player = nil
     attachedLayer = layer
-    layer.player = player
+    layerVisible = true
+    resetFirstFrame()
+    emitState()
   }
 
   func setLayerVisible(_ layer: AVPlayerLayer, visible: Bool) {
     guard !disposed, attachedLayer === layer else { return }
-    layer.player = visible ? player : nil
+    guard layerVisible != visible else { return }
+    layerVisible = visible
+    resetFirstFrame()
+    emitState()
   }
 
   func detachLayer(_ layer: AVPlayerLayer) {
     guard attachedLayer === layer else { return }
+    layerObservation?.invalidate()
     layer.player = nil
     attachedLayer = nil
+    resetFirstFrame()
+    emitState()
   }
 
   func getPosition() -> Int64 {
@@ -51,6 +102,7 @@ final class LumioNativePlayer: NSObject, FlutterTexture {
   private var playlistSources: [LumioAssetSource] = []
   private var queuedIndices: [ObjectIdentifier: Int] = [:]
   private var playlistIndex = 0
+  private var selectionEpoch: Int64 = 0
   var playlistLength: Int { playlistSources.count }
   private var item: AVPlayerItem?
   private var output: AVPlayerItemVideoOutput?
@@ -63,6 +115,7 @@ final class LumioNativePlayer: NSObject, FlutterTexture {
   // Flutter calls copyPixelBuffer on the raster thread, independently of main.
   private let pixelLock = NSLock()
   private var pixelBuffer: CVPixelBuffer?
+  private var pixelBufferItem: AVPlayerItem?
   private var disposed = false
   private var generation = 0
   private var configuration = try! LumioConfiguration([:])
@@ -113,6 +166,7 @@ final class LumioNativePlayer: NSObject, FlutterTexture {
   }
 
   func openPlaylist(sources: [LumioAssetSource], index: Int, configuration: LumioConfiguration) {
+    selectionEpoch = 0
     playlistSources = sources
     self.configuration = configuration
     completed = false
@@ -127,7 +181,8 @@ final class LumioNativePlayer: NSObject, FlutterTexture {
   }
 
   // Selection deliberately pauses. The parent sends play if playback is intended.
-  func selectPlaylistItem(index: Int) {
+  func selectPlaylistItem(index: Int, selectionEpoch: Int64 = 0) {
+    self.selectionEpoch = selectionEpoch
     wantsPlayback = false
     resumeAfterInterruption = false
     rebuildQueue(index: index)
@@ -170,6 +225,7 @@ final class LumioNativePlayer: NSObject, FlutterTexture {
     // Keep the last item installed so completion, final position and replay work.
     player.actionAtItemEnd = configuration.looping || index == playlistSources.count - 1 ? .pause : .advance
     self.item = item
+    resetFirstFrame()
     if viewType == .texture {
       let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
         kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
@@ -407,21 +463,29 @@ final class LumioNativePlayer: NSObject, FlutterTexture {
   }
 
   fileprivate func copyVideoFrame() {
-    guard !disposed, !background, let output = output, item?.status == .readyToPlay,
-          item === player.currentItem else { return }
+    guard !disposed, !background, viewType == .texture, let output = output,
+          let current = item, current.status == .readyToPlay,
+          current === player.currentItem else { return }
+    let token = firstFrame.token
     let time = output.itemTime(forHostTime: CACurrentMediaTime())
     guard output.hasNewPixelBuffer(forItemTime: time),
-          let buffer = output.copyPixelBuffer(forItemTime: time, itemTimeForDisplay: nil) else { return }
+          let buffer = output.copyPixelBuffer(forItemTime: time, itemTimeForDisplay: nil),
+          CVPixelBufferGetWidth(buffer) > 0, CVPixelBufferGetHeight(buffer) > 0,
+          !disposed, generation == token.generation, firstFrame.token == token,
+          self.output === output, item === current, player.currentItem === current,
+          current.status == .readyToPlay else { return }
     pixelLock.lock()
     pixelBuffer = buffer
+    pixelBufferItem = current
     pixelLock.unlock()
     registry.textureFrameAvailable(textureID)
+    if firstFrame.pixelBuffer(token) { emitState() }
   }
 
   func copyPixelBuffer() -> Unmanaged<CVPixelBuffer>? {
     pixelLock.lock()
     defer { pixelLock.unlock() }
-    guard let buffer = pixelBuffer else { return nil }
+    guard let buffer = pixelBuffer, pixelBufferItem === player.currentItem else { return nil }
     return Unmanaged.passRetained(buffer)
   }
 
@@ -455,7 +519,7 @@ final class LumioNativePlayer: NSObject, FlutterTexture {
     }
     let buffering = item != nil && item?.status != .failed && !completed &&
       (!initialized || seeking || (wantsPlayback && (player.timeControlStatus == .waitingToPlayAtSpecifiedRate || item?.isPlaybackBufferEmpty == true)))
-    emit([
+    var state: [String: Any] = [
       "id": id, "type": "state", "initialized": initialized,
       "playing": player.timeControlStatus == .playing, "buffering": buffering,
       "completed": completed, "positionMs": position, "durationMs": duration,
@@ -463,8 +527,11 @@ final class LumioNativePlayer: NSObject, FlutterTexture {
       "bufferedPositionMs": buffered, "bufferedRanges": bufferedRanges,
       "live": configuration.live || (initialized && item?.duration.isIndefinite == true),
       "volume": configuration.volume, "speed": configuration.speed,
-      "playlistIndex": playlistIndex, "playlistLength": playlistLength
-    ])
+      "playlistIndex": playlistIndex, "playlistLength": playlistLength,
+      "selectionEpoch": selectionEpoch
+    ]
+    state.merge(firstFrame.snapshot) { _, new in new }
+    emit(state)
   }
 
   private func milliseconds(_ time: CMTime) -> Int64 {
@@ -620,8 +687,10 @@ final class LumioNativePlayer: NSObject, FlutterTexture {
     output = nil
 
     item = nil
+    resetFirstFrame()
     pixelLock.lock()
     pixelBuffer = nil
+    pixelBufferItem = nil
     pixelLock.unlock()
   }
 

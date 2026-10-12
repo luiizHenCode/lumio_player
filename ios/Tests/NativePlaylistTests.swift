@@ -82,6 +82,29 @@ final class NativePlaylistTests: XCTestCase {
     XCTAssertEqual(registry.removals, 0)
   }
 
+  func testAudioOnlyReadyDoesNotWaitForFirstFrameOnEitherPath() throws {
+    for viewType: LumioViewType in [.texture, .platformView] {
+      let ready = expectation(description: "Audio ready without video evidence: \(viewType)")
+      var fulfilled = false
+      let player = makePlayer(viewType: viewType) { event in
+        guard event["type"] as? String == "state" else { return }
+        XCTAssertEqual(event["hasRenderedFirstFrame"] as? Bool, false)
+        XCTAssertEqual(event["firstFrameSupported"] as? Bool, true)
+        XCTAssertNil(event["firstFrameEvidence"])
+        if event["initialized"] as? Bool == true && !fulfilled {
+          XCTAssertEqual(event["buffering"] as? Bool, false)
+          fulfilled = true
+          ready.fulfill()
+        }
+      }
+      let surface = viewType == .platformView ? LumioPlayerSurface(frame: .zero, player: player) : nil
+      player.open(url: try audio(), configuration: try LumioConfiguration([:]))
+      wait(for: [ready], timeout: 10)
+      withExtendedLifetime(surface) { player.emitState() }
+      player.dispose()
+    }
+  }
+
   func testNativeAdvanceAndFinalCompletion() throws {
     let done = expectation(description: "Both queued items play and final item completes")
     var indices = Set<Int>()

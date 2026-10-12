@@ -161,6 +161,25 @@ struct ConfigurationTests {
         precondition(failure.code == "invalid_argument")
       }
     }
+    let defaultEpoch = try lumioSelectionEpoch([:])
+    precondition(defaultEpoch == 0)
+    for value: Int64 in [0, 1, 9_007_199_254_740_993, Int64.max] {
+      let parsed = try lumioSelectionEpoch(["selectionEpoch": NSNumber(value: value)])
+      precondition(parsed == value) // No Double rounding at 2^53 or Int64.max.
+    }
+    let integralFloat = try lumioSelectionEpoch(["selectionEpoch": 3.0])
+    precondition(integralFloat == 3)
+    for raw: Any in [true, false, -1, 0.5, 1e-200, -1e-200, "1", NSNull(), Double.nan,
+                     Double.infinity, -Double.infinity, Double(Int64.max),
+                     NSNumber(value: UInt64(Int64.max) + 1), NSNumber(value: UInt64.max)] {
+      do {
+        _ = try lumioSelectionEpoch(["selectionEpoch": raw])
+        fatalError("Accepted invalid selectionEpoch")
+      } catch let failure as LumioFailure {
+        precondition(failure.code == "invalid_argument")
+      }
+    }
+    print("PASS: selectionEpoch default, integral values, full Int64 precision, malformed/overflow rejection")
     // Item repeat and playlist wrapping can coexist; native playback gives item repeat priority.
     let both = try LumioConfiguration(["looping": true, "loopPlaylist": true])
     precondition(both.looping && both.loopPlaylist)

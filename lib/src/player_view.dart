@@ -271,8 +271,89 @@ class _HoldSpeedSession {
   }
 }
 
+// Shared only by presentations of the same controller. Recovery/fallback resets
+// backend frame evidence, but must not turn an already viewed source into an
+// initial opening again (including fullscreen ownership transfers).
+class _LoadingHistory {
+  static final _sessions = Expando<_LoadingHistory>();
+
+  _LoadingHistory(LumioPlayerController controller)
+    : source = controller.source,
+      index = controller.playlistIndex;
+
+  static _LoadingHistory of(LumioPlayerController controller) =>
+      _sessions[controller] ??= _LoadingHistory(controller);
+
+  LumioSource? source;
+  int index;
+  bool seenPlayback = false;
+
+  void observe(LumioPlayerController controller) {
+    if (!identical(source, controller.source) ||
+        index != controller.playlistIndex) {
+      source = controller.source;
+      index = controller.playlistIndex;
+      seenPlayback = false;
+    }
+    final state = controller.value;
+    final audio = controller.configuration.mode == LumioPlaybackMode.audio;
+    seenPlayback |= audio
+        ? state.initialized && state.playing
+        : state.hasRenderedFirstFrame ||
+              (!state.firstFrameSupported &&
+                  state.initialized &&
+                  state.playing);
+  }
+}
+
 class _LumioPlayerViewState extends State<LumioPlayerView> {
   Timer? _compactTimer, _seekFeedbackTimer;
+  Timer? _bufferingTimer;
+  bool _bufferingVisible = false;
+  late _LoadingHistory _loadingHistory;
+
+  bool get _recovering =>
+      _controller.isRecovering ||
+      _controller.value.phase == LumioPlaybackPhase.recovering;
+
+  bool get _loading {
+    final state = _controller.value;
+    if (state.error != null && !_controller.isRecovering) return false;
+    return _recovering ||
+        !state.initialized ||
+        state.buffering ||
+        state.transitioning ||
+        _controller.awaitingFirstFrame;
+  }
+
+  void _cancelBufferingIndicator() {
+    _bufferingTimer?.cancel();
+    _bufferingTimer = null;
+    _bufferingVisible = false;
+  }
+
+  void _observeLoading({bool reset = false}) {
+    if (reset) _cancelBufferingIndicator();
+    _loadingHistory.observe(_controller);
+    if (!_config.showLoader || !_loading || !_loadingHistory.seenPlayback) {
+      _cancelBufferingIndicator();
+      return;
+    }
+    // Recovery is explicit feedback, not a brief buffering flicker.
+    if (_recovering || _config.bufferingIndicatorDelay == Duration.zero) {
+      _cancelBufferingIndicator();
+      _bufferingVisible = true;
+    } else if (!_bufferingVisible && _bufferingTimer == null) {
+      _bufferingTimer = Timer(_config.bufferingIndicatorDelay, () {
+        _bufferingTimer = null;
+        if (!mounted || _disposing) return;
+        if (_config.showLoader && _loading && _loadingHistory.seenPlayback) {
+          setState(() => _bufferingVisible = true);
+        }
+      });
+    }
+  }
+
   Duration _seekFeedback = Duration.zero;
   bool? _doubleTapForward;
   bool _compacted = false, _interacting = false, _holding = false;
@@ -330,6 +411,8 @@ class _LumioPlayerViewState extends State<LumioPlayerView> {
     _source = _controller.source;
     _index = _controller.playlistIndex;
     _engine = _controller.value.engine;
+    _loadingHistory = _LoadingHistory.of(_controller);
+    _observeLoading();
     _controller.addListener(_changed);
     _schedule();
   }
@@ -364,8 +447,16 @@ class _LumioPlayerViewState extends State<LumioPlayerView> {
       _source = _controller.source;
       _index = _controller.playlistIndex;
       _engine = _controller.value.engine;
+      _loadingHistory = _LoadingHistory.of(_controller);
       _resetZoom();
     }
+    _observeLoading(
+      reset:
+          oldWidget.controller != _controller ||
+          oldWidget.controlsConfiguration.showLoader != _config.showLoader ||
+          oldWidget.controlsConfiguration.bufferingIndicatorDelay !=
+              _config.bufferingIndicatorDelay,
+    );
     if (!_enabled ||
         !_config.doubleTapSeek ||
         oldWidget.controlsConfiguration.seekInterval != _config.seekInterval) {
@@ -403,6 +494,7 @@ class _LumioPlayerViewState extends State<LumioPlayerView> {
       _scrubbing = false;
       _resetSeekFeedback();
     }
+    _observeLoading(reset: sourceChanged);
     if (sourceChanged) _resetZoom();
     _source = _controller.source;
     _index = _controller.playlistIndex;
@@ -553,6 +645,7 @@ class _LumioPlayerViewState extends State<LumioPlayerView> {
   @override
   void dispose() {
     _disposing = true;
+    _cancelBufferingIndicator();
     widget.compactedController?.removeListener(_presentationChanged);
     _resetSeekFeedback();
     _compactTimer?.cancel();
@@ -636,6 +729,9 @@ class _LumioPlayerViewState extends State<LumioPlayerView> {
 
   @override
   Widget build(BuildContext context) {
+    // Recovery may be scheduled immediately after the error notification. Read
+    // the getter again for this frame, without restarting an existing deadline.
+    _observeLoading();
     if (_fullscreenRouteActive) {
       return SizedBox(width: _inlineSize?.width, height: _inlineSize?.height);
     }
@@ -811,53 +907,126 @@ class _LumioPlayerViewState extends State<LumioPlayerView> {
                           ),
                         ),
                       if (_config.showLoader &&
+                          _loading &&
+                          (!_loadingHistory.seenPlayback ||
+                              _bufferingVisible) &&
                           !(_scrubbing &&
                               _enabled &&
                               _config.showProgress &&
                               _config.previewWhileScrubbing &&
                               _config.layout != LumioControlsLayout.live &&
-                              _seekable(_controller)) &&
-                          (state.buffering || state.transitioning))
-                        const IgnorePointer(
-                          child: Center(
-                            child: SizedBox.square(
-                              key: ValueKey('lumio-loading-indicator'),
-                              dimension: 48,
-                              child: DecoratedBox(
-                                decoration: BoxDecoration(
-                                  color: Color(0x61000000),
-                                  shape: BoxShape.circle,
-                                ),
-                                child: Center(
-                                  child: SizedBox.square(
-                                    dimension: 24,
-                                    child: CircularProgressIndicator(
-                                      strokeWidth: 2.6,
-                                      color: Colors.white,
-                                      semanticsLabel: 'Loading media',
+                              _seekable(_controller)))
+                        if (_loadingHistory.seenPlayback)
+                          Positioned(
+                            top: 12,
+                            left: 12,
+                            right: 12,
+                            child: IgnorePointer(
+                              child: Align(
+                                alignment: Alignment.topCenter,
+                                child: DecoratedBox(
+                                  key: const ValueKey('lumio-loading-badge'),
+                                  decoration: BoxDecoration(
+                                    color: Colors.black.withValues(alpha: .65),
+                                    borderRadius: BorderRadius.circular(20),
+                                  ),
+                                  child: Padding(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 12,
+                                      vertical: 8,
+                                    ),
+                                    child: Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        const SizedBox.square(
+                                          dimension: 14,
+                                          child: CircularProgressIndicator(
+                                            strokeWidth: 2,
+                                            color: Colors.white,
+                                          ),
+                                        ),
+                                        const SizedBox(width: 8),
+                                        Flexible(
+                                          child: Text(
+                                            _recovering
+                                                ? _config.reconnectingLabel
+                                                : _config.bufferingLabel,
+                                            maxLines: 1,
+                                            overflow: TextOverflow.ellipsis,
+                                            style: const TextStyle(
+                                              color: Colors.white,
+                                              fontSize: 12,
+                                            ),
+                                          ),
+                                        ),
+                                      ],
                                     ),
                                   ),
                                 ),
                               ),
                             ),
+                          )
+                        else
+                          IgnorePointer(
+                            child: Center(
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  const SizedBox.square(
+                                    key: ValueKey('lumio-loading-indicator'),
+                                    dimension: 48,
+                                    child: DecoratedBox(
+                                      decoration: BoxDecoration(
+                                        color: Color(0x61000000),
+                                        shape: BoxShape.circle,
+                                      ),
+                                      child: Center(
+                                        child: SizedBox.square(
+                                          dimension: 24,
+                                          child: CircularProgressIndicator(
+                                            strokeWidth: 2.6,
+                                            color: Colors.white,
+                                            semanticsLabel: 'Loading media',
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                  if (_recovering)
+                                    Padding(
+                                      padding: const EdgeInsets.all(8),
+                                      child: Text(
+                                        _config.reconnectingLabel,
+                                        textAlign: TextAlign.center,
+                                        style: const TextStyle(
+                                          color: Colors.white,
+                                          fontSize: 12,
+                                        ),
+                                      ),
+                                    ),
+                                ],
+                              ),
+                            ),
                           ),
-                        ),
-                      if (state.error case final error?)
-                        ColoredBox(
-                          color: Colors.black87,
-                          child:
-                              widget.errorBuilder?.call(context, error) ??
-                              Center(
-                                child: Padding(
-                                  padding: const EdgeInsets.all(12),
-                                  child: Text(
-                                    'Playback failed (${error.code}).',
-                                    textAlign: TextAlign.center,
-                                    style: const TextStyle(color: Colors.white),
+                      if (!_controller.isRecovering && state.error != null)
+                        if (state.error case final error?)
+                          ColoredBox(
+                            color: Colors.black87,
+                            child:
+                                widget.errorBuilder?.call(context, error) ??
+                                Center(
+                                  child: Padding(
+                                    padding: const EdgeInsets.all(12),
+                                    child: Text(
+                                      'Playback failed (${error.code}).',
+                                      textAlign: TextAlign.center,
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                      ),
+                                    ),
                                   ),
                                 ),
-                              ),
-                        ),
+                          ),
                       if (_enabled &&
                           _config.compact &&
                           _hidden &&
@@ -1788,7 +1957,9 @@ class _LumioPlayerControlsState extends State<LumioPlayerControls> {
                             ? Text(
                                 _scrubbingActive
                                     ? _config.pausedLabel
-                                    : state.buffering || state.transitioning
+                                    : state.buffering ||
+                                          state.transitioning ||
+                                          _controller.awaitingFirstFrame
                                     ? _config.loadingLabel
                                     : state.playing
                                     ? _config.playingLabel

@@ -281,11 +281,42 @@ class LumioBufferedRange {
   }
 }
 
+enum LumioPlaybackPhase {
+  idle,
+  connecting,
+  preparing,
+  ready,
+  playing,
+  buffering,
+  recovering,
+  failed,
+}
+
+/// Backend evidence, not a guarantee that pixels are visible on the host screen.
+enum LumioFirstFrameEvidence {
+  renderer,
+  pixelBuffer,
+  layerReady,
+  requestVideoFrameCallback,
+  loadedData;
+
+  static LumioFirstFrameEvidence? parse(Object? value) {
+    for (final evidence in values) {
+      if (evidence.name == value) return evidence;
+    }
+    return null;
+  }
+}
+
 /// State is owned by the controller. No native/plugin types leak into this API.
 @immutable
 class LumioPlayerState {
   LumioPlayerState({
     this.initialized = false,
+    this.hasRenderedFirstFrame = false,
+    this.firstFrameSupported = false,
+    this.firstFrameEvidence,
+    this.phase = LumioPlaybackPhase.idle,
     this.playing = false,
     this.buffering = false,
     this.completed = false,
@@ -304,6 +335,9 @@ class LumioPlayerState {
     this.error,
   }) : buffered = List.unmodifiable(buffered);
   final bool initialized, playing, buffering, completed, transitioning, live;
+  final bool hasRenderedFirstFrame, firstFrameSupported;
+  final LumioFirstFrameEvidence? firstFrameEvidence;
+  final LumioPlaybackPhase phase;
   final int playlistIndex, playlistLength;
   final Duration position, duration, bufferedPosition;
 
@@ -319,6 +353,11 @@ class LumioPlayerState {
       size.width > 0 && size.height > 0 ? size.width / size.height : 16 / 9;
   LumioPlayerState copyWith({
     bool? initialized,
+    bool? hasRenderedFirstFrame,
+    bool? firstFrameSupported,
+    LumioFirstFrameEvidence? firstFrameEvidence,
+    bool clearFirstFrame = false,
+    LumioPlaybackPhase? phase,
     bool? playing,
     bool? buffering,
     bool? completed,
@@ -338,6 +377,16 @@ class LumioPlayerState {
     bool clearError = false,
   }) => LumioPlayerState(
     initialized: initialized ?? this.initialized,
+    hasRenderedFirstFrame: clearFirstFrame
+        ? false
+        : hasRenderedFirstFrame ?? this.hasRenderedFirstFrame,
+    firstFrameSupported: clearFirstFrame
+        ? false
+        : firstFrameSupported ?? this.firstFrameSupported,
+    firstFrameEvidence: clearFirstFrame
+        ? null
+        : firstFrameEvidence ?? this.firstFrameEvidence,
+    phase: phase ?? this.phase,
     playing: playing ?? this.playing,
     buffering: buffering ?? this.buffering,
     completed: completed ?? this.completed,
@@ -358,7 +407,18 @@ class LumioPlayerState {
   LumioPlayerState apply(Map<String, dynamic> event) {
     double number(String key, double fallback) =>
         (event[key] as num?)?.toDouble() ?? fallback;
+    final evidence = LumioFirstFrameEvidence.parse(event['firstFrameEvidence']);
+    final supported = event['firstFrameSupported'] == true;
+    final frame =
+        supported && event['hasRenderedFirstFrame'] == true && evidence != null;
     return copyWith(
+      firstFrameSupported: firstFrameSupported || supported,
+      hasRenderedFirstFrame: hasRenderedFirstFrame || frame,
+      firstFrameEvidence: hasRenderedFirstFrame
+          ? firstFrameEvidence
+          : frame
+          ? evidence
+          : null,
       buffered: event.containsKey('bufferedRanges')
           ? LumioBufferedRange.parse(event['bufferedRanges'])
           : null,

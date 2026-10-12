@@ -31,6 +31,23 @@ func lumioPlaylistIndex(_ map: [String: Any], length: Int) throws -> Int {
   return Int(value)
 }
 
+func lumioSelectionEpoch(_ map: [String: Any]) throws -> Int64 {
+  guard let raw = map["selectionEpoch"] else { return 0 }
+  guard let number = raw as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+        number.doubleValue.isFinite, number.doubleValue >= 0,
+        number.doubleValue.rounded() == number.doubleValue,
+        var decimal = Decimal(string: number.stringValue, locale: Locale(identifier: "en_US_POSIX")),
+        decimal >= 0, decimal <= Decimal(Int64.max) else {
+    throw LumioFailure("invalid_argument", "selectionEpoch must be a nonnegative Int64 integer.")
+  }
+  var integer = Decimal()
+  NSDecimalRound(&integer, &decimal, 0, .plain)
+  guard integer == decimal else {
+    throw LumioFailure("invalid_argument", "selectionEpoch must be a nonnegative Int64 integer.")
+  }
+  return NSDecimalNumber(decimal: integer).int64Value
+}
+
 enum LumioViewType: String {
   case texture, platformView
 

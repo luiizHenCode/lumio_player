@@ -179,12 +179,18 @@ Map<String, Object?> safeFailureDiagnostics(Object? input, [int depth = 0]) {
     'details',
     'requestedBufferMs',
     'device',
+    'startup',
   ]) {
     if (input[key] is Map) {
       result[key] = safeFailureDiagnostics(input[key], depth + 1);
     }
   }
-  for (final key in const ['nativeErrorChain', 'accessLog', 'errorLog']) {
+  for (final key in const [
+    'nativeErrorChain',
+    'accessLog',
+    'errorLog',
+    'events',
+  ]) {
     final value = input[key];
     if (value is List) {
       result[key] = value
@@ -211,6 +217,12 @@ Map<String, Object?> safeFailureDiagnostics(Object? input, [int depth = 0]) {
 }
 
 const _numeric = {
+  'attempt',
+  'elapsedMs',
+  'createElapsedMs',
+  'readinessElapsedMs',
+  'firstFrameElapsedMs',
+  'playbackStartedElapsedMs',
   'initializationTimeoutMs',
   'commandTimeoutMs',
   'errorCode',
@@ -256,6 +268,8 @@ const _numeric = {
   'segmentsDownloadedDuration',
 };
 const _boolean = {
+  'hasRenderedFirstFrame',
+  'firstFrameSupported',
   'initialized',
   'playing',
   'buffering',
@@ -274,6 +288,32 @@ const _boolean = {
   'audioSessionMixesWithOthers',
 };
 const _enums = {
+  'stage': {
+    'idle',
+    'connecting',
+    'preparing',
+    'ready',
+    'playing',
+    'buffering',
+    'recovering',
+    'failed',
+    'unknown',
+    'unavailable',
+  },
+  'evidence': {
+    'renderer',
+    'pixelBuffer',
+    'layerReady',
+    'requestVideoFrameCallback',
+    'loadedData',
+  },
+  'firstFrameEvidence': {
+    'renderer',
+    'pixelBuffer',
+    'layerReady',
+    'requestVideoFrameCallback',
+    'loadedData',
+  },
   'platform': {'Android', 'iOS', 'android', 'ios', 'web'},
   'domain': {
     'AVFoundationErrorDomain',

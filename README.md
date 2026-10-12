@@ -20,6 +20,45 @@ Versão Dart atual: **0.1.0**. O pacote está em desenvolvimento; capacidades de
 - [Limitações e roadmap](#limitações-e-roadmap)
 - [Licença](#licença)
 
+## Primeiro frame, fase e startup (Fase 2)
+
+Interface para o host:
+
+- `controller.value.hasRenderedFirstFrame`: `bool`, padrão `false`; evidencia frame do item/tentativa atual, não visibilidade garantida no display.
+- `controller.value.firstFrameSupported`: `bool`, padrão `false` para backends legacy/sem evidência disponível.
+- `controller.value.firstFrameEvidence`: `LumioFirstFrameEvidence?`; use `.name` para a string de protocolo. Valores permitidos: `renderer` (Android), `pixelBuffer` (textura iOS), `layerReady` (Platform View iOS), `requestVideoFrameCallback` (WebView), `loadedData` (fallback WebView: dados de frame disponíveis, **não** confirmação de apresentação).
+- `controller.value.phase`: `LumioPlaybackPhase`, também acessível por `controller.phase`. Valores: `idle`, `connecting`, `preparing`, `ready`, `playing`, `buffering`, `recovering`, `failed`.
+- `controller.startupDiagnostics`: `Map<String, Object?>` profundamente imutável, sem consulta ao backend. Campos: `attempt`, `stage`, `evidence`, `createElapsedMs`, `readinessElapsedMs`, `firstFrameElapsedMs`, `playbackStartedElapsedMs`, `elapsedMs`, `events` (até 32 mapas imutáveis `stage`/`elapsedMs`). Os timings são inteiros ou `null` quando desconhecidos/não observados; antes de abrir, `attempt: 0`, `stage: idle`, sem timings. Não há UUID de sessão no plugin: o host pode envolver o snapshot com seu próprio UUID.
+- `(await controller.failureReport())?.metadata['startup']`: snapshot da tentativa que falhou, capturado **antes** de fallback/retry/recovery. Permanece separado dos diagnósticos da tentativa seguinte.
+
+`initialized` e a conclusão de `open()` continuam significando **readiness do backend**, independentemente de áudio/frame. `autoPlay: false` não espera um frame nem trava comandos. Após readiness, reprodução solicitada em modo vídeo/live e backend com suporte permanece em `ready` até evidência do primeiro frame; o loader pode continuar, mas os botões continuam habilitados. `playing` só representa playback com frame quando o backend oferece essa evidência; legacy sem suporte e modo `audio` mantêm a semântica de playback existente. Buffering real mantém feedback independente desse requisito, com delay visual/badge após playback observado conforme a seção de loading de apresentação. Nenhum watchdog/restart novo é acionado pela ausência de frame.
+
+Durante recovery, `recovering` permanece enquanto `transitioning` for verdadeiro, mesmo após readiness/frame, até concluir seek/play; erro continua tendo precedência (`failed`).
+
+Na seleção nativa explícita, o Dart incrementa e envia `selectionEpoch` antes de instalar readiness/resetar frame. Cada nova engine/open começa com epoch esperado `0`. Snapshots nativos com epoch numérico divergente são descartados antes de aplicar índice, frame, readiness ou timings; transições automáticas mantêm o epoch atual. Legacy sem epoch continua aceito, mas índices divergentes são ignorados durante seleção explícita pendente. Legacy não permite distinguir eventos antigos de uma reseleção do mesmo índice; essa proteção exige snapshots nativos com epoch.
+
+Os clocks usam `Stopwatch` monotônico desde a entrada em cada `_start`, **antes de `_release()`**: todos os timings dessa tentativa (inclusive `createElapsedMs`) incluem cleanup/diagnósticos pendentes da engine anterior, não medem somente criação nem conexão/rede. Os clocks seguem reiniciando por engine/fallback/recovery/retry/fonte/seleção, inclusive seleção do mesmo item. `attempt` cresce durante a vida do controller. Na seleção nativa explícita, `createElapsedMs` marca reutilização da engine, não criação de outro player; na troca automática observada, esse marco é desconhecido. `playbackStartedElapsedMs` registra o primeiro sinal `playing` do backend, separado do frame. As fases `connecting`/`preparing` são etapas do software, **não** tempos de DNS/TCP/HTTP/download; o backend não expõe esses dados, que continuam desconhecidos. Eventos de fases repetidas são omitidos; a lista é limitada aos 32 eventos mais recentes. Cada leitura retorna um snapshot independente, não um objeto mutável acompanhando o relógio; após dispose o relógio para.
+
+WebView registra/cancela `requestVideoFrameCallback` por elemento quando disponível, ignora callbacks de elementos substituídos/dispostos e faz latch de evidência uma vez. Sem essa API, só informa `loadedData` com dimensões de vídeo e dados decodificados disponíveis. Metadados sem dados não são frame. Vídeo sem áudio não depende de `hasAudio`; modo `audio` não registra evidência de vídeo nem espera por ela. Nativos devem emitir os três campos e resetar/guardar callbacks por fonte/item; o Dart aceita somente evidências enumeradas com ambos os booleans verdadeiros. Atualize assets e backends juntos e faça rebuild completo do consumidor.
+
+## Loading de apresentação (item 3)
+
+`LumioPlayerView` mostra loading central imediatamente na abertura, até readiness/evidência exigida pelo controller existente. Readiness pausada (`autoPlay: false`) não passa a esperar frame. Depois de playback observado, buffering/transições usam um badge discreto no topo da área de mídia, com spinner pequeno e `IgnorePointer`, sem cobrir os controles inferiores nem bloquear gestos. Considera-se playback observado: primeiro frame de vídeo, ou `initialized && playing` para vídeo legacy (`firstFrameSupported == false`) ou configuração `mode: audio`.
+
+```dart
+const LumioControlsConfiguration(
+  bufferingIndicatorDelay: Duration(milliseconds: 700), // padrão; zero = imediato
+  bufferingLabel: 'Carregando…',
+  reconnectingLabel: 'Reconectando…', // o app pode usar 'Reconectando à câmera…'
+);
+```
+
+O delay deve ser não negativo e é **somente visual**: não altera comandos, deadlines, watchdogs ou timers de recovery. Buffering que termina antes do delay não mostra badge; notificações de polling não reiniciam a espera. Sucesso, troca de fonte/índice/controller e dispose cancelam timers locais. O histórico de playback permanece associado ao controller/fonte/índice durante fallback/recovery da mesma fonte e remount/fullscreen, sem novo argumento público.
+
+Recovery pendente (`controller.isRecovering`, inclusive backoff agendado com `phase == failed`) evita o overlay fatal e, após playback observado, mostra `reconnectingLabel` imediatamente. Não basta `error.recoverable`: sem recovery pendente, o erro é terminal e mantém `errorBuilder`/retry. O getter deve refletir timer agendado, restart enfileirado ou startup de recuperação em transição, e suas mudanças precisam notificar a UI; a precedência de `failed` na fase permanece intacta.
+
+`showLoader: false` oculta os dois indicadores; `controls: false`/`enabled: false` não os ocultam. A supressão de loading durante scrubbing preview continua preservada. `loadingLabel` segue sendo o texto de status dos controles, separado dos labels do badge. A UI não captura pixels nem substitui a superfície para buffering; após release/recriação do backend durante recovery, não há garantia de retenção do último frame decodificado.
+
 ## Instalação e compatibilidade
 
 `pubspec.yaml` contém `publish_to: none`: **não há instalação publicada no pub.dev**. Em um app com o pacote em uma pasta irmã:

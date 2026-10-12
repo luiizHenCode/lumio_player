@@ -124,6 +124,57 @@ batch. Position/duration snapshots are emitted after native transitions, with pe
 updates every 500 ms while instances exist. A new event subscription gets a
 snapshot of all instances, plus their latest errors.
 
+### First-frame renderer evidence
+
+Every `state` snapshot (including subscription replay and diagnostics `state`)
+adds these StandardMessageCodec-safe fields; all existing fields, including
+video `width`/`height`, `id`, and `playlistIndex`, are unchanged:
+
+| Field | Type | Value |
+| --- | --- | --- |
+| `selectionEpoch` | integer (native Long) | 0 initially/on open; caller-supplied epoch on explicit selection |
+| `hasRenderedFirstFrame` | boolean | false until the current item's renderer callback is accepted |
+| `firstFrameSupported` | boolean | true for this ExoPlayer backend, in texture and platformView modes |
+| `firstFrameEvidence` | string, optional | `'renderer'` only when `hasRenderedFirstFrame` is true; omitted when false |
+
+Evidence means **“renderer apresentou frame”**: Media3
+`AnalyticsListener.onRenderedFirstFrame` reported rendering to its output. It
+is **not** a guarantee of a visible screen or Flutter composition. Neither the
+same SurfaceView nor a bound/available texture proves Flutter presented it.
+READY, dimensions, surface availability, and decoder initialization alone never
+set this flag. Audio-only playback stays false and can become initialized/READY
+normally without waiting for a video frame. `firstFrameSupported` describes the
+backend capability, not whether the current source contains video.
+
+Successful `open`/`openPlaylist`, explicit selection (even the same index), and
+native item transitions reset evidence to false. Invalid requests do not reset
+the current source. A first accepted callback emits an immediate `type: 'state'`
+snapshot for the same instance `id` and current `playlistIndex`; no separate
+`firstFrame` event is sent. Further callbacks do not duplicate that notification.
+Listeners are scoped to the exact ExoPlayer and item generation; callbacks from
+released/replaced players, prior selections, mismatched event timelines/indexes,
+and renderer timestamps strictly before the reset are ignored. A callback from
+the current generation rendered in the same millisecond as the reset is accepted;
+old-generation listeners remain invalid even with an equal/newer timestamp. Surface remount alone does not
+reset historical evidence for the current item.
+
+`selectPlaylistItem` additionally accepts optional `selectionEpoch`: a
+non-negative integer within signed 64-bit range. Omission preserves the current
+epoch (legacy behavior); explicit null, wrong types, negative/fractional values,
+and overflow return `invalid_argument` before resetting evidence or selecting.
+The instance updates the epoch before resetting the listener or invoking the
+native seek, so synchronous state callbacks already carry the requested epoch.
+All `state` snapshots include `selectionEpoch`, including renderer notifications,
+periodic updates, replay, and diagnostics. Successful `open`/`openPlaylist` reset
+it to 0; automatic item transitions keep it unchanged. Epochs are caller tokens,
+not native counters: native code neither increments them nor enforces monotonicity.
+Dart can increment its expected epoch per explicit selection, reset it to 0 on
+start/open, and reject queued states whose epoch differs, including old same-item
+states carrying previous first-frame evidence.
+
+Native code supplies evidence only: no first-frame wait, timeout, readiness gate,
+retry, or stage budget is introduced. Dart owns any stage pipeline and budgets.
+
 `bufferedRanges` is a list of `{startMs, endMs}` integer-millisecond maps. Media3
 exposes only the current item's forward-buffer endpoint, not arbitrary cached
 or disconnected ranges. We report at most one known interval, **currentPosition
@@ -193,7 +244,12 @@ than changing plugin dependencies.
 Standalone, from `android/`:
 
 ```sh
-../example/android/gradlew -p . -I validation.init.gradle compileDebugKotlin testDebugUnitTest
+# Set JAVA_HOME to the literal JDK 17 home installed on your machine.
+# Example Homebrew installation on macOS:
+JAVA_HOME=/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home ../example/android/gradlew -Dorg.gradle.java.home=/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home -p . -I validation.init.gradle compileDebugKotlin testDebugUnitTest
+
+# Focused mocked first-frame tests (same JDK 17 requirement):
+JAVA_HOME=/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home ../example/android/gradlew -Dorg.gradle.java.home=/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home -p . -I validation.init.gradle testDebugUnitTest --tests 'dev.lumio.lumio_player.FirstFrameEvidenceTest'
 ```
 
 The optional host init script remains available for validating a host that has
@@ -209,5 +265,9 @@ repeat precedence, Media3 queue loading, selection play-intent preservation
 detached-engine behavior. Additional Mockito tests cover create-mode parsing,
 position/range guards, native output ownership across fullscreen replacement,
 Flutter detach/remount, player replacement, and late callbacks after disposal.
+First-frame Mockito tests additionally cover the exact typed protocol, initial
+false state, renderer emission, reopen/source replacement, same-item reselection,
+playlist index/timeline transitions, queued/old callbacks, disposal, and READY
+without a frame (no playback gate).
 Actual decoding, network playback, texture rendering, and surface recreation
 require device/emulator integration testing.

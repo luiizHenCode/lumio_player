@@ -298,9 +298,9 @@ void main() {
             if (intendedPlaying) 'play',
           ]);
           expect(native.named('selectPlaylistItem').map((c) => c.arguments), [
-            {'id': 1, 'index': 1},
-            {'id': 1, 'index': 2},
-            {'id': 1, 'index': 1},
+            {'id': 1, 'index': 1, 'selectionEpoch': 1},
+            {'id': 1, 'index': 2, 'selectionEpoch': 2},
+            {'id': 1, 'index': 1, 'selectionEpoch': 3},
           ]);
           expect(controller.value.playing, intendedPlaying);
           expect(controller.value.initialized, isTrue);

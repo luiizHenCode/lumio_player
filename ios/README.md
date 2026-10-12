@@ -65,7 +65,7 @@ setting. Diagnostics list these keys under `unsupportedSettings`.
 ```text
 openPlaylist({id, sources: [sourceMap, ...], index: 0,
               config: {autoPlay: true, looping: false, loopPlaylist: true}})
-selectPlaylistItem({id, index: 1})
+selectPlaylistItem({id, index: 1, selectionEpoch: 1})
 play({id}) // Only if the parent intends to play after next/previous.
 ```
 
@@ -73,6 +73,25 @@ Every source and the complete configuration are validated before replacing the
 current queue. Invalid/empty lists and missing, boolean, fractional, or out-of-range
 indices return `invalid_argument`; a bad source leaves the old playlist installed.
 `open` is a one-item playlist and replaces any previous playlist.
+
+`selectPlaylistItem` accepts optional `selectionEpoch`, a nonnegative `Int64`
+integer (`0...9223372036854775807`); omission defaults to `0`. Booleans, strings,
+null, fractions, nonfinite numbers and overflow return `invalid_argument` before
+selection changes the queue. Integral numeric values are accepted, with full
+Int64 precision (the parser does not round integer channel values through Double).
+The epoch is assigned **before** pause/reset/bind/state emission, including
+same-index selection. Every `state` contains `selectionEpoch: Int64`, initially
+`0`; successful `open`/`openPlaylist` reset it to `0` before source replacement.
+Native advance/repeat/wrap and surface remount retain the current selection epoch.
+This channel value is distinct from the private observation token/epoch.
+
+The consuming Dart integration must increment its expected epoch **before**
+sending each explicit selection (including same-index selections), pass that
+value as `selectionEpoch`, and discard snapshots whose epoch is not equal to
+its expected value. Before `open`/`openPlaylist`, reset the expected epoch to `0`.
+Checking `playlistIndex` alone cannot distinguish two selections of the same
+index. Native code echoes the supplied epoch; it does not increment it or impose
+monotonicity. No Dart implementation is changed here.
 
 The same native `AVQueuePlayer` and selected rendering mode are retained across all items.
 AVPlayerItems from the selected index through the end are actually queued;
@@ -150,7 +169,9 @@ and disposal handling and preserve the current play/pause intent.
 Every event includes `id` and `type`. A `state` includes `initialized`, `playing`,
 `buffering`, `completed`, `positionMs`, `durationMs`, `width`, `height`,
 `bufferedPositionMs`, `bufferedRanges`, `live`, `volume`, `speed`, `playlistIndex`, and
-`playlistLength`. Index is zero-based; a newly created empty player reports index
+`playlistLength`, plus `hasRenderedFirstFrame` and `firstFrameSupported` (both
+booleans), `selectionEpoch` (`Int64`), and conditional `firstFrameEvidence`.
+Index is zero-based; a newly created empty player reports index
 zero and length zero. Metadata and duration describe only the current item. `speed` is the configured
 playback speed even when paused; `playing` reflects AVPlayer's actual playback
 state. An unknown/indefinite duration is reported as zero. `live` is true when
@@ -173,6 +194,65 @@ error and emit an `error` with `code`, `message`, `details`, and `recoverable`.
 Native item/playback failures are marked nonrecoverable for the current item;
 a new `open` can still replace it. Interrupted/cancelled seeks return method
 errors. Commands on a created player without an item (`play`/`pause`) are no-ops.
+
+### First-frame evidence (Phase 2, baseline `6fe8921`)
+
+The additive wire contract on the existing `type: "state"` snapshot is:
+
+| Field | Exact value / semantics |
+| --- | --- |
+| `hasRenderedFirstFrame` | `Bool`, initially `false`; latched `true` after current-context native video evidence. |
+| `firstFrameSupported` | `Bool`, always `true` for both iOS `texture` and `platformView`, including empty/audio-only items. This describes backend capability, not the presence of video. |
+| `firstFrameEvidence` | **Absent** while `hasRenderedFirstFrame` is `false` (not null or an empty string). When true, exactly `"pixelBuffer"` for texture or `"layerReady"` for platform view. |
+| `selectionEpoch` | Nonnegative `Int64`, default `0`, reset to `0` by open/openPlaylist, assigned from explicit selection before reset/emission, unchanged by native transitions. |
+
+Texture evidence requires `hasNewPixelBuffer` and the first successful,
+nonempty `copyVideoFrame` buffer from the current ready item/output. Source
+and item identity are rechecked after copying. Cached raster-thread buffers
+belonging to an old current item are not returned as a new item's buffer.
+Calling Flutter's `copyPixelBuffer` alone does not establish evidence.
+
+Platform-view resets use **disconnect `layer.player = nil` → reset context →
+install readiness observer → qualify exclusive current-item binding → assign
+player**. This ordering applies to new/reused layers, source/current-item changes,
+same-index selection and visibility reattachment. It observes readiness during
+the player setter instead of missing it and waiting forever for another false.
+An evidence-bearing bind requires visibility and matching item/current-item
+identity. Empty players retain layer/queue ownership but cannot produce evidence.
+
+A new `isReadyForDisplay == true` notification from that qualified bind counts
+without requiring an intervening false notification. A post-bind readiness sample
+also catches an image ready immediately inside the setter, but only if the
+**disconnected baseline was false**; a retained true baseline is not evidence
+merely because it is sampled again. No unqualified initial-true observation is
+accepted. If a reused layer remains true across disconnect, it must supply a new
+notification for the newly observed bind, not a cached readiness read. Disconnect
+and rebind create a fresh rendering binding even for explicit same-item selection.
+
+Source generation, item/current-item identity, layer/player identity and the
+private observation token reject delayed callbacks from previous bindings.
+An old callback cannot complete or arm the new binding, and rejecting it does
+not prevent a subsequent current binding notification from completing evidence.
+
+Evidence resets on every source replacement, native current-item transition,
+and explicit playlist selection (even the same index). Platform-view attach,
+replacement, removal and visibility detach/reattach also reset it; callbacks
+from replaced surfaces cannot affect the active surface. Disposal invalidates
+observations and stops events. Ordinary seek/play/pause do not reset it.
+
+The first accepted evidence emits a state immediately on main, rather than
+waiting for the 500 ms timer. Later frames/ready notifications do not emit
+additional first-frame states; existing state triggers and periodic snapshots
+continue unchanged. There is no separate `firstFrame` event or loading logic.
+
+**Evidence is not a display guarantee**: copying a pixel buffer or layer readiness
+does not certify Flutter rasterization, compositing, screen visibility, or a
+user-visible image. `initialized` still means `AVPlayerItem.status == .readyToPlay`;
+`buffering` is unchanged and does not depend on first-frame evidence. Audio-only
+items can initialize/play normally with `hasRenderedFirstFrame: false`,
+`firstFrameSupported: true` and no evidence. Native code never waits for a video
+frame that audio-only media cannot provide. No Dart/root or Android changes are
+part of this iOS implementation.
 
 ### Opt-in native platform view
 
@@ -340,3 +420,55 @@ Additional runtime coverage should include live HLS `seekToLive`, seek
 supersession/disposal, VOD rejection, loop/end events, buffering/failures, audio
 interruptions, background/foreground, source replacement, and engine detach.
 No Dart or other platform files are changed by this iOS implementation.
+
+### Phase 2 first-frame validation (2026-10-12)
+
+Validated on macOS arm64 with Apple Swift 6.4 in Swift 5 mode, Xcode's
+`iPhoneSimulator27.0.sdk`, iOS 13 simulator deployment target, and cached
+`/opt/homebrew/share/flutter/bin/cache/artifacts/engine/ios/Flutter.xcframework/ios-arm64_x86_64-simulator`.
+Warnings were treated as errors.
+
+- Production `LumioFirstFrameEvidence` helper executable: **executed and passed**.
+  Covers exact fields/evidence omission, source/current-item/same-selection reset,
+  late pixel tokens, old-image attachment/reattachment, old false/true callbacks,
+  layer replacement, disposal-style reset and one-shot notification decisions.
+  Review regression coverage additionally proves immediate readiness during a
+  qualified new bind, post-bind sampling, rebind without any false notification,
+  rejection of retained true samples and rejection of late old callbacks without
+  blocking new-bind evidence.
+- Existing configuration/timeline/live-seek and live-error executables:
+  **executed and passed** against the production helpers/parsers.
+  The production selectionEpoch parser passed default/valid/integral cases,
+  exact `2^53 + 1` and `Int64.max`, and boolean/null/string/fraction/nonfinite/
+  overflow rejection.
+- All production Swift sources: **compiled and linked** using the simulator
+  compilation command above, including the new helper.
+- `NativeFirstFrameTests`, `NativePlaylistTests`, `NativePlayerViewTests`,
+  `AudioPolicyTests`: **typechecked only** using the typecheck command above
+  with `ios/Tests/NativeFirstFrameTests.swift` added to its test inputs.
+  Synthetic layer KVO coverage checks observer-before-bind ordering, synchronous
+  new-image readiness, nil/rebind without false, retained image rejection, a queued
+  old callback, old surfaces, visibility/removal and disposal. Selection coverage
+  checks epoch assignment before emitted states, same-index selections, automatic
+  transition retention and reset on open/openPlaylist. These XCTest assertions
+  were typechecked, **not executed**.
+  Native audio-only coverage checks ready/nonbuffering state without video
+  evidence on both rendering paths.
+
+Reproduce the additional host executable from the package root:
+
+```sh
+xcrun --sdk macosx swiftc -swift-version 5 -warnings-as-errors \
+  ios/lumio_player/Sources/lumio_player/LumioFirstFrameEvidence.swift \
+  ios/Tests/FirstFrameEvidenceTests.swift -o ios/.native-validation/first-frame-tests
+ios/.native-validation/first-frame-tests
+```
+
+An iPhone 17 / iOS 26.5 simulator was booted when inspected, but there is no
+configured standalone XCTest host for these files. **No iOS XCTest, playback,
+rendering or first-frame runtime execution is claimed for Phase 2.** Synthetic
+KVO tests do not validate AVFoundation decoding/display behavior. Device/simulator
+runtime checks still need real video source replacement, queue advance,
+paused/live startup, layer retained-image reattachment, Flutter composition,
+background/foreground and audio-only playback. Historical integration results
+in this document do not validate these new fields.

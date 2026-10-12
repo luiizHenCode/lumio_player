@@ -1,5 +1,25 @@
 # Changelog
 
+## Próxima versão — loading UX (item 3)
+
+- Abertura inicial com loading central imediato; após playback observado, buffering/transição usa badge pequeno no topo da mídia, com `IgnorePointer`, sem overlay fatal durante recovery pendente.
+- Configuração visual `bufferingIndicatorDelay` (700ms padrão, zero permitido, negativo rejeitado), `bufferingLabel` (`Carregando…`) e `reconnectingLabel` (`Reconectando…`). Recovery explícito mostra feedback imediato; o app pode fornecer label de câmera.
+- Timer visual cancelado no sucesso/troca de fonte/índice/controller/dispose, sem reiniciar com polling. Histórico interno preservado em fallback/recovery da mesma fonte e remount/fullscreen; áudio e vídeo legacy usam readiness + playing, vídeo suportado exige evidência de frame.
+- `showLoader: false` oculta todos os loaders; controles desabilitados não os ocultam. Erros terminais mantêm error builder/retry; supressão durante scrubbing preview preservada. Sem captura de pixels, mudanças em comandos ou políticas de recovery, nem promessa de retenção de frame após release nativo.
+- Testes de apresentação cobrem debounce, cancelamento, configuração, evidência de playback, recovery versus erro terminal e fullscreen.
+
+## Próxima versão — primeiro frame e startup (Fase 2)
+
+- Review: `recovering` persiste durante toda a transição, inclusive readiness/frame com seek/play pendentes; erros mantêm precedência.
+- Review: seleção nativa explícita envia `selectionEpoch` incremental e rejeita snapshots de outra seleção antes de aplicar estado/timings; nova engine reinicia epoch em zero e transições automáticas preservam o atual. Legacy sem epoch mantém compatibilidade com proteção de índice enquanto há seleção pendente.
+- Documentado que timings de `_start`, inclusive `createElapsedMs`, incluem cleanup da engine anterior, não apenas criação/conexão nem tempo de rede.
+
+- Estado público conservador `hasRenderedFirstFrame`, `firstFrameSupported`, `LumioFirstFrameEvidence?` e `LumioPlaybackPhase` em `state.phase`/`controller.phase`.
+- Readiness/open/comandos preservados: sem espera por frame em `autoPlay: false`, áudio ou vídeo sem áudio. Loader após readiness espera evidência somente quando playback de vídeo foi solicitado e suportado, sem desabilitar comandos ou criar watchdog/restart.
+- `startupDiagnostics`: snapshots profundamente imutáveis por tentativa, timings monotônicos opcionais, trace limitado e metadata `startup` retida na falha antes de substituição, sem URLs/mensagens/paths/UUID.
+- WebView: callback de primeiro frame cancelável e protegido por elemento/generation; fallback `loadedData` distingue disponibilidade de dados de apresentação, com reset/late-event guards.
+- Testes Dart/JS para readiness, áudio, seleção/retry/fallback/recovery, snapshots de falha, imutabilidade e callbacks tardios. Validação física continua pendente na checklist.
+
 ## Próxima versão — timeouts independentes
 
 - `LumioPlayerConfiguration.commandTimeout` opcional: getter efetivo usa `initializationTimeout` quando omitido, preservando construtores existentes. Comandos e consultas usam o limite separado no Dart/WebView, sem reduzir o orçamento de create/open/readiness/playlist nem alterar fallback/recovery.

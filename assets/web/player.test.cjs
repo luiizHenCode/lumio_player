@@ -20,7 +20,7 @@ test('HTML keeps viewport and centered media CSS inside a valid document structu
   assert.match(html, /<\/head>\s*<body>\s*<video id="media" playsinline webkit-playsinline preload="auto"><\/video>\s*<script src="player.js"><\/script>\s*<\/body>/);
 });
 
-function harness({nativeHls = false, hls = false, destroyFails = false, pauseFails = false} = {}) {
+function harness({nativeHls = false, hls = false, destroyFails = false, pauseFails = false, frameCallback = false} = {}) {
   const events = [];
   let current;
   let interval;
@@ -31,6 +31,12 @@ function harness({nativeHls = false, hls = false, destroyFails = false, pauseFai
       this.currentTime = 0; this.duration = NaN; this.volume = 1;
       this.playbackRate = 1; this.readyState = 0;
       this.buffered = {length: 0};
+      if (frameCallback) {
+        this.frameCallbacks = [];
+        this.cancelledFrames = [];
+        this.requestVideoFrameCallback = fn => { this.frameCallbacks.push(fn); return this.frameCallbacks.length; };
+        this.cancelVideoFrameCallback = id => this.cancelledFrames.push(id);
+      }
     }
     addEventListener(name, fn) { (this.listeners[name] ||= []).push(fn); }
     emit(name) { for (const fn of this.listeners[name] || []) fn(); }
@@ -69,6 +75,55 @@ function harness({nativeHls = false, hls = false, destroyFails = false, pauseFai
 }
 const source = {uri: 'https://example.com/private.m3u8?secret=token', format: 'hls',
   live: false, autoPlay: false, looping: false, volume: 0.5, speed: 1.25};
+
+test('advancing video falls back to decoded data when an available frame callback never arrives', async () => {
+  const h = harness({nativeHls: true, frameCallback: true});
+  await h.receive('open', {...source, live: true});
+  const media = h.media();
+  media.videoWidth = 1920;
+  media.videoHeight = 1080;
+  media.readyState = 3;
+  media.emit('loadedmetadata');
+  await h.receive('play');
+  media.emit('playing');
+  let state = h.events.filter(e => e.type === 'state').at(-1);
+  assert.equal(state.hasRenderedFirstFrame, false);
+  assert.equal(state.firstFrameSupported, true);
+  media.currentTime = 1;
+  media.emit('timeupdate');
+  state = h.events.filter(e => e.type === 'state').at(-1);
+  assert.equal(state.buffering, false);
+  assert.equal(state.playing, true);
+  assert.equal(state.hasRenderedFirstFrame, true);
+  assert.equal(state.firstFrameEvidence, 'loadedData');
+  assert.deepEqual(media.cancelledFrames, [1]);
+  // A late callback must not overwrite the qualified fallback evidence.
+  media.frameCallbacks[0]();
+  assert.equal(h.events.filter(e => e.type === 'state').at(-1).firstFrameEvidence, 'loadedData');
+  await h.receive('open', source, 9);
+  assert.equal(h.events.filter(e => e.type === 'state').at(-1).hasRenderedFirstFrame, false);
+  media.emit('timeupdate');
+  assert.equal(h.events.filter(e => e.type === 'state').at(-1).hasRenderedFirstFrame, false);
+});
+
+test('frame callback fallback does not claim data for stalled, paused, seeking or audio playback', async () => {
+  for (const mode of ['stalled', 'paused', 'seeking', 'audio', 'noVideoSize', 'noProgress']) {
+    const h = harness({nativeHls: true, frameCallback: true});
+    await h.receive('open', {...source, mode: mode === 'audio' ? 'audio' : 'live'});
+    const media = h.media();
+    media.videoWidth = mode === 'noVideoSize' ? 0 : 1920;
+    media.videoHeight = mode === 'noVideoSize' ? 0 : 1080;
+    media.readyState = mode === 'stalled' ? 2 : 3;
+    media.emit('loadedmetadata');
+    await h.receive('play');
+    media.paused = mode === 'paused';
+    media.seeking = mode === 'seeking';
+    media.currentTime = mode === 'noProgress' ? 0 : 1;
+    media.emit('timeupdate');
+    const state = h.events.filter(e => e.type === 'state').at(-1);
+    assert.equal(state.hasRenderedFirstFrame, false, mode);
+  }
+});
 
 test('ready handshake, metadata acknowledgment and audio-only state protocol', async () => {
   const h = harness({nativeHls: true});
@@ -127,6 +182,67 @@ test('video-only playback does not wait for audio and stalled fetching does not 
   state = h.events.filter(e => e.type === 'state').at(-1);
   assert.equal(state.buffering, false);
   assert.equal(state.playing, true);
+});
+
+test('first frame callback is one-shot, independent of audio and guarded on reset/dispose', async () => {
+  const h = harness({nativeHls: true, frameCallback: true});
+  const latest = () => h.events.filter(e => e.type === 'state').at(-1);
+  await h.receive('open', source);
+  const old = h.media();
+  old.videoWidth = 1920; old.videoHeight = 1080; old.readyState = 3;
+  old.emit('loadedmetadata');
+  assert.equal(latest().initialized, true);
+  assert.equal(latest().firstFrameSupported, true);
+  assert.equal(latest().hasRenderedFirstFrame, false);
+  old.emit('loadeddata');
+  assert.equal(old.frameCallbacks.length, 1);
+  old.frameCallbacks[0]();
+  assert.equal(latest().hasRenderedFirstFrame, true);
+  assert.equal(latest().firstFrameEvidence, 'requestVideoFrameCallback');
+  const count = h.events.length;
+  old.frameCallbacks[0]();
+  assert.equal(h.events.length, count);
+  await h.receive('open', source, 2);
+  assert.equal(latest().hasRenderedFirstFrame, false);
+  old.frameCallbacks[0]();
+  assert.equal(latest().hasRenderedFirstFrame, false);
+  const media = h.media();
+  media.videoWidth = 640; media.videoHeight = 360;
+  media.emit('loadedmetadata');
+  await h.receive('open', source, 3);
+  assert.deepEqual(media.cancelledFrames, [1]);
+  media.frameCallbacks[0]();
+  assert.equal(latest().hasRenderedFirstFrame, false);
+  const last = h.media();
+  last.videoWidth = 640; last.videoHeight = 360;
+  last.emit('loadedmetadata');
+  await h.receive('dispose', {}, 4);
+  assert.deepEqual(last.cancelledFrames, [1]);
+  const disposedCount = h.events.length;
+  last.frameCallbacks[0]();
+  assert.equal(h.events.length, disposedCount);
+});
+
+test('loaded data fallback is explicit; metadata alone and audio mode do not claim frames', async () => {
+  const h = harness({nativeHls: true});
+  const latest = () => h.events.filter(e => e.type === 'state').at(-1);
+  await h.receive('open', source);
+  const media = h.media();
+  media.videoWidth = 640; media.videoHeight = 360; media.readyState = 1;
+  media.emit('loadedmetadata');
+  assert.equal(latest().firstFrameSupported, false);
+  assert.equal(latest().hasRenderedFirstFrame, false);
+  media.readyState = 2;
+  media.emit('loadeddata');
+  assert.equal(latest().hasRenderedFirstFrame, true);
+  assert.equal(latest().firstFrameSupported, true);
+  assert.equal(latest().firstFrameEvidence, 'loadedData');
+  await h.receive('open', {...source, mode: 'audio'});
+  h.media().videoWidth = 640; h.media().videoHeight = 360; h.media().readyState = 3;
+  h.media().emit('loadedmetadata'); h.media().emit('loadeddata');
+  assert.equal(latest().initialized, true);
+  assert.equal(latest().hasRenderedFirstFrame, false);
+  assert.equal(latest().firstFrameSupported, false);
 });
 
 test('buffering remains visible without sufficient data or actual playback progress', async () => {

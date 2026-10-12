@@ -239,6 +239,8 @@ void main() {
       await tester.pumpWidget(host(c, configuration: preview));
       c.value = c.value.copyWith(buffering: true);
       await tester.pump();
+      expect(find.byType(CircularProgressIndicator), findsNothing);
+      await tester.pump(const Duration(milliseconds: 700));
       expect(find.byType(CircularProgressIndicator), findsOneWidget);
       slider(tester).onChangeStart!(0);
       slider(tester).onChanged!(10000);
@@ -256,6 +258,8 @@ void main() {
       expect(find.byType(CircularProgressIndicator), findsNothing);
       c.value = c.value.copyWith(buffering: true);
       await tester.pump();
+      expect(find.byType(CircularProgressIndicator), findsNothing);
+      await tester.pump(const Duration(milliseconds: 700));
       expect(find.byType(CircularProgressIndicator), findsOneWidget);
       await close(tester, c);
       expect(tester.takeException(), isNull);
@@ -348,6 +352,7 @@ void main() {
           next.value = next.value.copyWith(buffering: true);
         }
         await tester.pumpWidget(host(next, configuration: preview));
+        await tester.pump(const Duration(milliseconds: 700));
         expect(find.byType(CircularProgressIndicator), findsOneWidget);
         slider(tester).onChangeStart!(0);
         slider(tester).onChanged!(30000);

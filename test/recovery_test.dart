@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:lumio_player/lumio_player.dart';
@@ -67,6 +69,123 @@ void main() {
     await player.dispose();
     native.uninstall();
   });
+
+  test(
+    'recovery feedback stays active while the previous engine is being released',
+    () async {
+      await player.open(source);
+      final releasing = Completer<void>();
+      final releaseDone = Completer<void>();
+      addTearDown(() {
+        if (!releaseDone.isCompleted) releaseDone.complete();
+      });
+      native.intercept = (call) async {
+        if (call.method == 'dispose') {
+          if (!releasing.isCompleted) releasing.complete();
+          await releaseDone.future;
+        }
+        return native.respond(call);
+      };
+      await error('ERROR_CODE_IO_NETWORK_CONNECTION_FAILED');
+      expect(player.isRecovering, true);
+      await releasing.future;
+      expect(player.value.transitioning, false);
+      expect(player.isRecovering, true);
+      releaseDone.complete();
+      await flush(30);
+      expect(player.isRecovering, false);
+      expect(player.value.error, isNull);
+    },
+  );
+
+  test(
+    'recovery creates a fresh timing attempt and retains failure snapshot',
+    () async {
+      await player.open(source);
+      await state({
+        'firstFrameSupported': true,
+        'hasRenderedFirstFrame': true,
+        'firstFrameEvidence': 'renderer',
+      });
+      final before = player.startupDiagnostics;
+      await error('ERROR_CODE_IO_NETWORK_CONNECTION_FAILED');
+      final failed = (await player.failureReport())!.metadata['startup'] as Map;
+      expect(failed['attempt'], 1);
+      expect(failed['firstFrameElapsedMs'], before['firstFrameElapsedMs']);
+      await flush(70);
+      expect(player.startupDiagnostics['attempt'], 2);
+      expect(player.startupDiagnostics['readinessElapsedMs'], isA<int>());
+      expect(player.startupDiagnostics['firstFrameElapsedMs'], isNull);
+      expect(player.value.hasRenderedFirstFrame, false);
+      expect((await player.failureReport())!.metadata['startup'], failed);
+    },
+  );
+
+  test(
+    'readiness and frame do not finish recovering while seek or play is pending',
+    () async {
+      await player.dispose();
+      player = LumioPlayerController(
+        recovery: recovery,
+        configuration: const LumioPlayerConfiguration(
+          engine: LumioPlaybackEngine.native,
+          mode: LumioPlaybackMode.live,
+          allowAutomaticFallback: false,
+          initializationTimeout: Duration(seconds: 2),
+        ),
+      );
+      await player.open(source);
+      final seekEntered = Completer<void>();
+      final seekDone = Completer<void>();
+      final playEntered = Completer<void>();
+      final playDone = Completer<void>();
+      addTearDown(() {
+        if (!seekDone.isCompleted) seekDone.complete();
+        if (!playDone.isCompleted) playDone.complete();
+      });
+      native.intercept = (call) async {
+        if (call.method == 'seekToLive') {
+          seekEntered.complete();
+          await seekDone.future;
+          return null;
+        }
+        if (call.method == 'play') {
+          await state({
+            'initialized': true,
+            'playing': true,
+            'buffering': false,
+            'firstFrameSupported': true,
+            'hasRenderedFirstFrame': true,
+            'firstFrameEvidence': 'renderer',
+          });
+          playEntered.complete();
+          await playDone.future;
+          return null;
+        }
+        return native.respond(call);
+      };
+      await error('hls_live_segment_unavailable');
+      expect(player.phase, LumioPlaybackPhase.failed);
+      await seekEntered.future.timeout(const Duration(seconds: 1));
+      expect(player.value.initialized, true);
+      expect(player.value.transitioning, true);
+      expect(player.phase, LumioPlaybackPhase.recovering);
+      expect(player.startupDiagnostics['stage'], 'recovering');
+      expect(player.startupDiagnostics['readinessElapsedMs'], isA<int>());
+      seekDone.complete();
+      await playEntered.future.timeout(const Duration(seconds: 1));
+      expect(player.value.hasRenderedFirstFrame, true);
+      expect(player.value.playing, true);
+      expect(player.value.transitioning, true);
+      expect(player.phase, LumioPlaybackPhase.recovering);
+      expect(player.startupDiagnostics['stage'], 'recovering');
+      playDone.complete();
+      await flush();
+      expect(player.value.transitioning, false);
+      expect(player.phase, LumioPlaybackPhase.playing);
+      expect(player.startupDiagnostics['stage'], 'playing');
+    },
+  );
 
   test('configuration validates even when disabled', () {
     for (final config in [

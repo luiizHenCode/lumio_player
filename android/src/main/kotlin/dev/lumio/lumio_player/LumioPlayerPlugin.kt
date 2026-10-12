@@ -248,6 +248,12 @@ class LumioPlayerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         private var released = false
         private var hasSource = false
         private var initialized = false
+        private var selectionEpoch = 0L
+        private val firstFrame = FirstFrameEvidence(
+            currentPlayer = { player },
+            nowMs = { SystemClock.elapsedRealtime() },
+            emitState = { emitState() },
+        )
         private val hlsLiveSegmentFailure = HlsLiveSegmentFailure()
         private var requestedLive = false
         val nativeSurface = if (producer == null) NativeSurfaceBinding { player } else null
@@ -363,6 +369,7 @@ class LumioPlayerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             val replacement = buildPlayer(config)
             try {
                 previewSeek.sourceChanged()
+                firstFrame.clear()
                 hlsLiveSegmentFailure.clear()
                 cleanupAll(
                     { player.removeListener(this) },
@@ -375,6 +382,7 @@ class LumioPlayerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
                 throw error
             }
             player = replacement
+            selectionEpoch = 0L
             hasSource = true
             initialized = false
             requestedLive = config.live
@@ -391,12 +399,14 @@ class LumioPlayerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             lastError = null
             player.addListener(this)
             player.addAnalyticsListener(this)
+            firstFrame.reset(player)
             if (surfaceAvailable) producer?.let { player.setVideoSurface(it.surface) }
             nativeSurface?.rebind()
             player.volume = config.volume
             player.setPlaybackSpeed(config.speed)
             player.repeatMode = playlistRepeatMode(config.looping, loopPlaylist)
             player.loadPlaylist(prepared.map { it.mediaSource }, request.index, config.autoPlay)
+            emitState()
         }
 
         fun setLooping(looping: Boolean) {
@@ -405,11 +415,14 @@ class LumioPlayerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
 
         fun selectPlaylistItem(args: Map<*, *>) {
             val index = args.playlistIndex(player.mediaItemCount)
+            selectionEpoch = args.selectionEpoch(selectionEpoch)
             resetCurrentItem(index)
             player.selectPlaylistItem(index)
+            emitState()
         }
 
         private fun resetCurrentItem(index: Int) {
+            firstFrame.reset(player)
             previewSeek.sourceChanged()
             hlsLiveSegmentFailure.clear()
             initialized = false
@@ -475,6 +488,7 @@ class LumioPlayerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         }
 
         override fun onEvents(player: Player, events: Player.Events) {
+            if (released || player !== this.player) return
             // Seamless transitions may remain READY without a playback-state callback.
             if (player.playbackState == Player.STATE_READY) initialized = true
             emitState()
@@ -544,6 +558,7 @@ class LumioPlayerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         private fun state(): Map<String, Any> = mapOf(
             "id" to id,
             "type" to "state",
+            "selectionEpoch" to selectionEpoch,
             "playlistIndex" to player.currentMediaItemIndex,
             "playlistLength" to player.mediaItemCount,
             "initialized" to initialized,
@@ -559,7 +574,7 @@ class LumioPlayerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
             "live" to (requestedLive || player.isCurrentMediaItemLive),
             "volume" to player.volume.toDouble(),
             "speed" to player.playbackParameters.speed.toDouble(),
-        )
+        ) + firstFrame.stateFields()
 
         fun emitState() {
             if (!released && sink != null) sink?.success(state())
@@ -607,6 +622,7 @@ class LumioPlayerPlugin : FlutterPlugin, MethodChannel.MethodCallHandler,
         fun dispose() {
             if (released) return
             released = true
+            firstFrame.clear()
             hlsLiveSegmentFailure.clear()
             sources = emptyList()
             lastError = null
@@ -801,6 +817,9 @@ internal data class QueueRequest(val sources: List<Map<*, *>>, val index: Int) {
         }
     }
 }
+
+internal fun Map<*, *>.selectionEpoch(current: Long): Long =
+    if (containsKey("selectionEpoch")) requiredNonNegativeLong("selectionEpoch") else current
 
 internal fun Map<*, *>.playlistIndex(length: Int): Int {
     val index = requiredNonNegativeLong("index")

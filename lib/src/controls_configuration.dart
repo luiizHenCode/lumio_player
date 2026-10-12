@@ -46,6 +46,9 @@ class LumioControlsConfiguration {
     this.showRetry = true,
     this.showLiveButton = true,
     this.showLoader = true,
+    this.bufferingIndicatorDelay = const Duration(milliseconds: 700),
+    this.bufferingLabel = 'Carregando…',
+    this.reconnectingLabel = 'Reconectando…',
     this.showStatistics = false,
     this.playbackSpeeds = const [1, 2, 3, 4],
     this.doubleTapSeek = true,
@@ -83,6 +86,13 @@ class LumioControlsConfiguration {
   final Duration scrubPreviewInterval;
   final bool showVolume, showPlaylistNavigation, showSettings, showTime;
   final bool showTitle, showRetry, showLoader;
+
+  /// Visual debounce after observed playback; never delays opening or recovery.
+  /// Zero shows the small media badge immediately. Must not be negative.
+  final Duration bufferingIndicatorDelay;
+
+  /// Media badge labels, independent of the controls' [loadingLabel].
+  final String bufferingLabel, reconnectingLabel;
 
   /// Retained for source compatibility. The live label is always informational.
   @Deprecated(
@@ -123,6 +133,9 @@ class LumioControlsConfiguration {
       throw ArgumentError(
         'Playback speeds must be unique, finite values in .25..4.',
       );
+    }
+    if (bufferingIndicatorDelay.isNegative) {
+      throw ArgumentError('Buffering indicator delay must not be negative.');
     }
     if (scrubPreviewInterval <= Duration.zero) {
       throw ArgumentError('Scrub preview interval must be positive.');

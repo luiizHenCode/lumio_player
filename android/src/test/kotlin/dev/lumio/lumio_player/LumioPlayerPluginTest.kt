@@ -423,6 +423,27 @@ internal class LumioPlayerPluginTest {
     }
 
     @Test
+    fun selectionEpochAcceptsChannelIntegersAndPreservesLegacyEpochWhenOmitted() {
+        assertEquals(0L, emptyMap<String, Any>().selectionEpoch(0L))
+        assertEquals(7L, emptyMap<String, Any>().selectionEpoch(7L))
+        assertEquals(0L, mapOf("selectionEpoch" to 0).selectionEpoch(7L))
+        assertEquals(8L, mapOf("selectionEpoch" to 8).selectionEpoch(7L))
+        assertEquals(9L, mapOf("selectionEpoch" to 9L).selectionEpoch(7L))
+        assertEquals(10L, mapOf("selectionEpoch" to 10.0).selectionEpoch(7L))
+        assertEquals(Long.MAX_VALUE, mapOf("selectionEpoch" to Long.MAX_VALUE).selectionEpoch(7L))
+    }
+
+    @Test
+    fun selectionEpochRejectsExplicitNullWrongTypesFractionsAndOverflow() {
+        listOf(null, "8", true, -1, -1L, 1.5, Double.NaN,
+            Double.POSITIVE_INFINITY, 9_223_372_036_854_775_808.0).forEach { value ->
+            assertFailsWith<IllegalArgumentException> {
+                mapOf("selectionEpoch" to value).selectionEpoch(7L)
+            }
+        }
+    }
+
+    @Test
     fun parsesQueueAndSingleOpenThroughTheSameContract() {
         val first = mapOf("type" to "network", "uri" to "https://example.test/a")
         val second = mapOf("type" to "asset", "uri" to "video.mp4")

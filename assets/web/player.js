@@ -13,6 +13,17 @@
   let requestedFit = 'contain';
   let mediaListeners = [];
   let lastObservedTime = 0;
+  let hasRenderedFirstFrame = false;
+  let firstFrameSupported = false;
+  let firstFrameEvidence = null;
+  let frameRequest = null;
+  let audioMode = false;
+  const cancelFrame = element => {
+    if (frameRequest != null && typeof element.cancelVideoFrameCallback === 'function') {
+      element.cancelVideoFrameCallback(frameRequest);
+    }
+    frameRequest = null;
+  };
   const applyFit = () => {
     video.style.width = '100%';
     video.style.height = '100%';
@@ -68,7 +79,8 @@
       droppedVideoFrames: quality ? quality.droppedVideoFrames : null,
       codecPolicy: 'Codec declared by the selected HLS.js rendition; native HTML decoder is not exposed.'
     };
-    post({type: 'state', fit: requestedFit, media, initialized, playing: initialized && !video.paused && !video.ended && !buffering,
+    post({type: 'state', fit: requestedFit, media, initialized,
+          hasRenderedFirstFrame, firstFrameSupported, firstFrameEvidence, playing: initialized && !video.paused && !video.ended && !buffering,
       buffering, completed: video.ended, positionMs: milliseconds(video.currentTime),
       durationMs: milliseconds(video.duration), width: video.videoWidth || 0, height: video.videoHeight || 0,
       bufferedPositionMs, bufferedRanges, live: requestedLive || detectedLive || video.duration === Infinity,
@@ -83,6 +95,10 @@
   };
   const reset = () => {
     generation++;
+    cancelFrame(video);
+    hasRenderedFirstFrame = false;
+    firstFrameSupported = false;
+    firstFrameEvidence = null;
     if (opening != null) ack(opening, false, 'open_cancelled');
     opening = null;
     if (hls) { hls.destroy(); hls = null; }
@@ -112,6 +128,29 @@
     }
   };
   function bind(element, epoch) {
+    const markFrame = evidence => {
+      if (disposed || epoch !== generation || element !== video || hasRenderedFirstFrame || audioMode) return;
+      hasRenderedFirstFrame = true;
+      firstFrameEvidence = evidence;
+      state();
+    };
+    const observeFrame = () => {
+      if (audioMode || !(element.videoWidth > 0 && element.videoHeight > 0)) return;
+      if (typeof element.requestVideoFrameCallback === 'function') {
+        firstFrameSupported = true;
+        if (frameRequest == null && !hasRenderedFirstFrame) {
+          frameRequest = element.requestVideoFrameCallback(() => {
+            if (disposed || epoch !== generation || element !== video) return;
+            frameRequest = null;
+            markFrame('requestVideoFrameCallback');
+          });
+        }
+      } else if (element.readyState >= 2) {
+        // Decoded data is available; this does not claim screen visibility.
+        firstFrameSupported = true;
+        markFrame('loadedData');
+      }
+    };
     const listen = (name, callback) => {
       const handler = () => { if (!disposed && epoch === generation) callback(); };
       element.addEventListener(name, handler);
@@ -120,6 +159,7 @@
     listen('loadedmetadata', () => {
       applyFit();
       initialized = true;
+      observeFrame();
       buffering = video.readyState < 3;
       const request = opening;
       opening = null;
@@ -127,6 +167,7 @@
       ack(request, true);
       if (autoplay) void play().catch(() => {});
     });
+    listen('loadeddata', () => { observeFrame(); state(); });
     listen('waiting', () => {
       buffering = !video.ended;
       state();
@@ -142,6 +183,14 @@
       if (initialized && !video.paused && !video.ended && !video.seeking &&
           video.readyState >= 3 && position > lastObservedTime) {
         buffering = false;
+        if (!audioMode && !hasRenderedFirstFrame &&
+            element.videoWidth > 0 && element.videoHeight > 0) {
+          // Some WebViews expose rVFC without delivering it. Advancing media
+          // with decoded video data is weaker evidence, not screen visibility.
+          cancelFrame(element);
+          firstFrameSupported = true;
+          markFrame('loadedData');
+        }
       }
       lastObservedTime = position;
       state();
@@ -150,7 +199,7 @@
       buffering = false;
       state();
     });
-    listen('resize', applyFit);
+    listen('resize', () => { applyFit(); observeFrame(); state(); });
     for (const name of ['pause', 'seeking', 'seeked', 'durationchange', 'volumechange', 'ratechange', 'progress']) {
       listen(name, state);
     }
@@ -167,6 +216,7 @@
     requestedLive = args.live;
     setFit(args.fit || requestedFit);
     autoplay = args.autoPlay;
+    audioMode = args.mode === 'audio';
     buffering = true;
     video.loop = args.looping;
     video.volume = args.volume;
@@ -210,6 +260,7 @@
     generation++;
     let failed = false;
     const attempt = action => { try { action(); } catch (_) { failed = true; } };
+    attempt(() => cancelFrame(video));
     const pending = opening;
     opening = null;
     attempt(() => ack(pending, false, 'open_cancelled', true));
